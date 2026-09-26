@@ -1,7 +1,7 @@
-#include "ncnn_llm_ocr.h"
+﻿#include "ncnn_llm_ocr.h"
 #include "utils/vision_rope.h"
 
-ncnn_llm_ocr::ncnn_llm_ocr(const std::string& model_path, bool use_vulkan, int num_threads)
+ncnn_llm_ocr::ncnn_llm_ocr(const std::string& model_path, bool use_vulkan, int num_threads, bool use_bf16)
     : ncnn_llm_base(use_vulkan, num_threads > 0 ? num_threads : 4) {
     try {
         json config;
@@ -34,6 +34,11 @@ ncnn_llm_ocr::ncnn_llm_ocr(const std::string& model_path, bool use_vulkan, int n
             text_decoder_net_->opt.use_fp16_storage = false;
         } else {
             printf("[ncnn_llm_ocr] Vulkan disabled, using CPU only\n");
+        }
+
+        if (use_bf16) {
+            text_decoder_net_->opt.use_bf16_storage = true;
+            printf("[ncnn_llm_ocr] BF16 storage enabled for decoder\n");
         }
 
         std::string vision_param = model_path + "/" + config["params"]["vision_param"].get<std::string>();

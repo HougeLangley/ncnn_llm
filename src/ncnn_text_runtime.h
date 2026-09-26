@@ -27,7 +27,9 @@ ncnn::Mat llm_run_decoder_with_kv(ncnn::Net& decoder_net,
                                   const ncnn::Mat& sin_cache,
                                   KVCache& kv_cache,
                                   int attn_cnt,
-                                  bool is_prefill);
+                                  bool is_prefill,
+                                  ncnn::Allocator* kvcache_allocator = nullptr,
+                                  int max_seqlen_hint = 0);
 
 ncnn::Mat llm_run_lm_head(ncnn::Net& lm_head_net, const ncnn::Mat& hidden_states);
 

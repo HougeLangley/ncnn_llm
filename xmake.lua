@@ -89,7 +89,7 @@ target("benchllm")
     add_files("benchmark/benchllm.cpp")
 
     add_deps("ncnn_llm")
-    add_packages("ncnn")
+    add_packages("ncnn", "nlohmann_json")
 
     set_rundir("$(projectdir)/assets/minicpm4_0.5b/")
 
@@ -102,11 +102,12 @@ target("test_llm")
 
     set_rundir("$(projectdir)/")
 
-target("nllb_main")
+target("test_bf16")
     set_kind("binary")
-    add_files("examples/nllb_main.cpp")
+    add_includedirs("tests/")
+    add_files("tests/test_bf16.cpp")
     add_deps("ncnn_llm")
-    add_packages("ncnn")
+    add_packages("ncnn", "nlohmann_json")
 
     set_rundir("$(projectdir)/")
 
@@ -151,3 +152,4 @@ target("asr_main")
     end
 
     set_rundir("$(projectdir)/")
+

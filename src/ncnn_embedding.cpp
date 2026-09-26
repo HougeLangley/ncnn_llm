@@ -3,7 +3,7 @@
 #include <cmath>
 #include <algorithm>
 
-ncnn_embedding::ncnn_embedding(const std::string& model_path, bool use_vulkan, int num_threads, int vulkan_device) {
+ncnn_embedding::ncnn_embedding(const std::string& model_path, bool use_vulkan, int num_threads, int vulkan_device, bool use_bf16) {
     try {
         json config;
         {
@@ -52,6 +52,14 @@ ncnn_embedding::ncnn_embedding(const std::string& model_path, bool use_vulkan, i
             use_vulkan_ = true;
         } else {
             printf("[ncnn_embedding] Vulkan disabled, using CPU only\n");
+        }
+
+        if (use_bf16) {
+            text_encoder_net->opt.use_bf16_storage = true;
+            if (vision_encoder_net) {
+                vision_encoder_net->opt.use_bf16_storage = true;
+            }
+            printf("[ncnn_embedding] BF16 storage enabled\n");
         }
 
         std::string encoder_param, encoder_bin;

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <array>
 #include <cassert>
@@ -31,7 +31,7 @@ using nlohmann::json;
 
 class ncnn_llm_ocr : public ncnn_llm_base {
 public:
-    ncnn_llm_ocr(const std::string& model_path, bool use_vulkan = false, int num_threads = 0);
+    ncnn_llm_ocr(const std::string& model_path, bool use_vulkan = false, int num_threads = 0, bool use_bf16 = true);
 
     std::shared_ptr<ncnn_llm_gpt_ctx> prefill(const std::string& prompt_text, const ncnn::Mat& bgr_image);
     std::shared_ptr<ncnn_llm_gpt_ctx> generate(const std::shared_ptr<ncnn_llm_gpt_ctx>& ctx,

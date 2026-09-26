@@ -38,9 +38,17 @@ ncnn::Mat llm_run_decoder_with_kv(ncnn::Net& decoder_net,
                                   const ncnn::Mat& sin_cache,
                                   KVCache& kv_cache,
                                   int attn_cnt,
-                                  bool is_prefill) {
+                                  bool is_prefill,
+                                  ncnn::Allocator* kvcache_allocator,
+                                  int max_seqlen_hint) {
     ncnn::Mat decode_out;
     ncnn::Extractor ex = decoder_net.create_extractor();
+    if (kvcache_allocator) {
+        ex.set_kvcache_allocator(kvcache_allocator);
+    }
+    if (max_seqlen_hint > 0) {
+        ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
+    }
     ex.input("in0", embeds);
     ex.input("in1", mask);
     ex.input("in2", cos_cache);
@@ -53,6 +61,8 @@ ncnn::Mat llm_run_decoder_with_kv(ncnn::Net& decoder_net,
             std::snprintf(name_v_in, sizeof(name_v_in), "cache_v%d", i);
             ex.input(name_k_in, kv_cache[i].first);
             ex.input(name_v_in, kv_cache[i].second);
+            kv_cache[i].first.release();
+            kv_cache[i].second.release();
         }
     }
 
@@ -61,8 +71,8 @@ ncnn::Mat llm_run_decoder_with_kv(ncnn::Net& decoder_net,
         std::snprintf(name_k_out, sizeof(name_k_out), "out_cache_k%d", i);
         std::snprintf(name_v_out, sizeof(name_v_out), "out_cache_v%d", i);
         ncnn::Mat k_cache, v_cache;
-        ex.extract(name_k_out, k_cache);
-        ex.extract(name_v_out, v_cache);
+        ex.extract(name_k_out, k_cache, 1);
+        ex.extract(name_v_out, v_cache, 1);
         if (is_prefill) {
             kv_cache.emplace_back(std::move(k_cache), std::move(v_cache));
         } else {

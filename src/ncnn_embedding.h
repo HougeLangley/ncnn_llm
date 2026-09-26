@@ -39,7 +39,7 @@ private:
     bool ok_ = true;
 
 public:
-    ncnn_embedding(const std::string& model_path, bool use_vulkan = false, int num_threads = 0, int vulkan_device = 0);
+    ncnn_embedding(const std::string& model_path, bool use_vulkan = false, int num_threads = 0, int vulkan_device = 0, bool use_bf16 = true);
 
     std::vector<float> encode_text(const std::string& text) const;
     std::vector<std::vector<float>> encode_text_batch(const std::vector<std::string>& texts) const;

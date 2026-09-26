@@ -7,15 +7,20 @@ static std::shared_ptr<ncnn_llm_gpt_ctx> clone_ctx(const std::shared_ptr<ncnn_ll
 }
 
 static std::shared_ptr<ncnn_llm_gpt_ctx> create_ctx(int sconv_cnt, int gdr_cnt) {
+    std::shared_ptr<ncnn_llm_gpt_ctx> ctx;
     if (sconv_cnt > 0 || gdr_cnt > 0) {
-        return std::make_shared<qwen3_5_ctx>();
+        ctx = std::make_shared<qwen3_5_ctx>();
+    } else {
+        ctx = std::make_shared<ncnn_llm_gpt_base_ctx>();
     }
-    return std::make_shared<ncnn_llm_gpt_base_ctx>();
+    ctx->kvcache_allocator = std::make_shared<ncnn::UnlockedPoolAllocator>();
+    ctx->kvcache_allocator->set_size_compare_ratio(0.f);
+    return ctx;
 }
 
 // Class Implementation
 
-ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int num_threads, int vulkan_device) 
+ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int num_threads, int vulkan_device, bool use_bf16) 
     : vision_type(Vision_Type::VISION_CLOSE) {
     try {
         json config;
@@ -52,6 +57,11 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
             decoder_net->opt.use_vulkan_compute = true;
         } else {
             printf("[ncnn_llm_gpt] Vulkan disabled, using CPU only\n");
+        }
+
+        if (use_bf16) {
+            decoder_net->opt.use_bf16_storage = true;
+            printf("[ncnn_llm_gpt] BF16 storage enabled for decoder\n");
         }
 
 
@@ -282,12 +292,20 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         }
     }
 
+    auto ctx = create_ctx(sconv_cnt, gdr_cnt);
+    ncnn::Allocator* kv_alloc = ctx->kvcache_allocator ? ctx->kvcache_allocator.get() : nullptr;
+    const int max_seqlen_hint = (int)token_ids.size() + 512;
+
     std::vector<std::pair<ncnn::Mat, ncnn::Mat>> kv_cache;
     std::vector<ncnn::Mat> sconv_cache;
     std::vector<ncnn::Mat> gdr_cache;
     ncnn::Mat decode_out;
     {
         ncnn::Extractor ex = decoder_net->create_extractor();
+        if (kv_alloc) {
+            ex.set_kvcache_allocator(kv_alloc);
+            ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
+        }
         ex.input("in0", token_embed);
         ex.input("in1", mask);
         ex.input("in2", cos_cache);
@@ -298,8 +316,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(name_k_out, sizeof(name_k_out), "out_cache_k%d", i);
             std::snprintf(name_v_out, sizeof(name_v_out), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(name_k_out, k_cache);
-            ex.extract(name_v_out, v_cache);
+            ex.extract(name_k_out, k_cache, 1);
+            ex.extract(name_v_out, v_cache, 1);
             kv_cache.emplace_back(std::move(k_cache), std::move(v_cache));
         }
 
@@ -346,6 +364,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
 
     {
         ncnn::Extractor ex = decoder_net->create_extractor();
+        if (kv_alloc) {
+            ex.set_kvcache_allocator(kv_alloc);
+            ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
+        }
         ex.input("in0", last_token_embed);
         ex.input("in1", last_mask);
         ex.input("in2", last_cos_cache);
@@ -357,6 +379,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(name_v_in, sizeof(name_v_in), "cache_v%d", i);
             ex.input(name_k_in, kv_cache[i].first);
             ex.input(name_v_in, kv_cache[i].second);
+            kv_cache[i].first.release();
+            kv_cache[i].second.release();
         }
 
         for (int i = 0; i < sconv_cnt; i++) {
@@ -376,8 +400,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(name_k_out, sizeof(name_k_out), "out_cache_k%d", i);
             std::snprintf(name_v_out, sizeof(name_v_out), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(name_k_out, k_cache);
-            ex.extract(name_v_out, v_cache);
+            ex.extract(name_k_out, k_cache, 1);
+            ex.extract(name_v_out, v_cache, 1);
             kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -419,7 +443,6 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         }
     }
 
-    auto ctx = create_ctx(sconv_cnt, gdr_cnt);
     ctx->kv_cache = std::move(kv_cache);
     ctx->cur_token = next_token_id;
     ctx->position_id = (int)token_ids.size() + 1;
@@ -437,6 +460,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
 
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input_text, const ncnn::Mat& bgr, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const {
     std::shared_ptr<ncnn_llm_gpt_ctx> new_ctx = clone_ctx(ctx);
+    ncnn::Allocator* kv_alloc = new_ctx->kvcache_allocator ? new_ctx->kvcache_allocator.get() : nullptr;
+    const int max_seqlen_hint = new_ctx->position_id + (int)input_text.size() + 512;
 
     ncnn::Mat image_embeds;
     int num_patches_w = 0;
@@ -485,6 +510,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     ncnn::Mat decode_out;
     {
         ncnn::Extractor ex = decoder_net->create_extractor();
+        if (kv_alloc) {
+            ex.set_kvcache_allocator(kv_alloc);
+            ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
+        }
         ex.input("in0", token_embed);
         ex.input("in1", mask);
         ex.input("in2", cos_cache);
@@ -496,6 +525,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(vname, sizeof(vname), "cache_v%d", i);
             ex.input(kname, new_ctx->kv_cache[i].first);
             ex.input(vname, new_ctx->kv_cache[i].second);
+            new_ctx->kv_cache[i].first.release();
+            new_ctx->kv_cache[i].second.release();
         }
 
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
@@ -517,8 +548,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
             std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(kname, k_cache);
-            ex.extract(vname, v_cache);
+            ex.extract(kname, k_cache, 1);
+            ex.extract(vname, v_cache, 1);
             new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -557,6 +588,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
 
     {
         ncnn::Extractor ex = decoder_net->create_extractor();
+        if (kv_alloc) {
+            ex.set_kvcache_allocator(kv_alloc);
+            ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
+        }
         ex.input("in0", last_token_embed);
         ex.input("in1", last_mask);
         ex.input("in2", last_cos_cache);
@@ -568,6 +603,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(vname, sizeof(vname), "cache_v%d", i);
             ex.input(kname, new_ctx->kv_cache[i].first);
             ex.input(vname, new_ctx->kv_cache[i].second);
+            new_ctx->kv_cache[i].first.release();
+            new_ctx->kv_cache[i].second.release();
         }
 
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
@@ -589,8 +626,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
             std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(kname, k_cache);
-            ex.extract(vname, v_cache);
+            ex.extract(kname, k_cache, 1);
+            ex.extract(vname, v_cache, 1);
             new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -638,6 +675,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
 
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input_text, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const {
     std::shared_ptr<ncnn_llm_gpt_ctx> new_ctx = clone_ctx(ctx);
+    ncnn::Allocator* kv_alloc = new_ctx->kvcache_allocator ? new_ctx->kvcache_allocator.get() : nullptr;
+    const int max_seqlen_hint = new_ctx->position_id + (int)input_text.size() + 512;
 
     auto token_ids = bpe->encode(input_text, false, false);
     int last_token_id = token_ids.back();
@@ -678,6 +717,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     ncnn::Mat decode_out;
     {
         ncnn::Extractor ex = decoder_net->create_extractor();
+        if (kv_alloc) {
+            ex.set_kvcache_allocator(kv_alloc);
+            ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
+        }
         ex.input("in0", token_embed);
         ex.input("in1", mask);
         ex.input("in2", cos_cache);
@@ -689,6 +732,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(vname, sizeof(vname), "cache_v%d", i);
             ex.input(kname, new_ctx->kv_cache[i].first);
             ex.input(vname, new_ctx->kv_cache[i].second);
+            new_ctx->kv_cache[i].first.release();
+            new_ctx->kv_cache[i].second.release();
         }
 
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
@@ -710,8 +755,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
             std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(kname, k_cache);
-            ex.extract(vname, v_cache);
+            ex.extract(kname, k_cache, 1);
+            ex.extract(vname, v_cache, 1);
             new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -760,6 +805,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
 
     {
         ncnn::Extractor ex = decoder_net->create_extractor();
+        if (kv_alloc) {
+            ex.set_kvcache_allocator(kv_alloc);
+            ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
+        }
         ex.input("in0", last_token_embed);
         ex.input("in1", last_mask);
         ex.input("in2", last_cos_cache);
@@ -771,6 +820,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(vname, sizeof(vname), "cache_v%d", i);
             ex.input(kname, new_ctx->kv_cache[i].first);
             ex.input(vname, new_ctx->kv_cache[i].second);
+            new_ctx->kv_cache[i].first.release();
+            new_ctx->kv_cache[i].second.release();
         }
 
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
@@ -792,8 +843,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
             std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(kname, k_cache);
-            ex.extract(vname, v_cache);
+            ex.extract(kname, k_cache, 1);
+            ex.extract(vname, v_cache, 1);
             new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -912,9 +963,15 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(ctx);
         if (!qwen_ctx) {
             decode_out = llm_run_decoder_with_kv(*decoder_net, cur_embed, mask, cos_cache, sin_cache,
-                                                 ctx->kv_cache, attn_cnt, false);
+                                                 ctx->kv_cache, attn_cnt, false,
+                                                 ctx->kvcache_allocator ? ctx->kvcache_allocator.get() : nullptr,
+                                                 ctx->position_id + cfg.max_new_tokens);
         } else {
             ncnn::Extractor ex = decoder_net->create_extractor();
+            if (ctx->kvcache_allocator) {
+                ex.set_kvcache_allocator(ctx->kvcache_allocator.get());
+                ex.set_kvcache_max_seqlen_hint(ctx->position_id + cfg.max_new_tokens);
+            }
             ex.input("in0", cur_embed);
             ex.input("in1", mask);
             ex.input("in2", cos_cache);
@@ -926,6 +983,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
                 std::snprintf(vname, sizeof(vname), "cache_v%d", i);
                 ex.input(kname, ctx->kv_cache[i].first);
                 ex.input(vname, ctx->kv_cache[i].second);
+                ctx->kv_cache[i].first.release();
+                ctx->kv_cache[i].second.release();
             }
 
             for (int i = 0; i < sconv_cnt; ++i) {
@@ -944,8 +1003,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
                 std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
                 std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
                 ncnn::Mat k_cache, v_cache;
-                ex.extract(kname, k_cache);
-                ex.extract(vname, v_cache);
+                ex.extract(kname, k_cache, 1);
+                ex.extract(vname, v_cache, 1);
                 ctx->kv_cache[i] = { std::move(k_cache), std::move(v_cache) };
             }
 

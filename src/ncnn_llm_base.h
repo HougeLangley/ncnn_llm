@@ -130,7 +130,7 @@ protected:
     ncnn::Option create_option() const {
         ncnn::Option opt;
         opt.num_threads = num_threads_;
-        opt.use_bf16_storage = false;
+        opt.use_bf16_storage = true;
         opt.use_vulkan_compute = use_vulkan_;
         return opt;
     }

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <functional>
 #include <memory>
@@ -23,7 +23,7 @@
 // plain RoPE cache (generate_rope_embed_cache, theta 1e6) and the bbpe tokenizer.
 class ncnn_llm_asr : public ncnn_llm_base {
 public:
-    ncnn_llm_asr(const std::string& model_path, bool use_vulkan = false, int num_threads = 0);
+    ncnn_llm_asr(const std::string& model_path, bool use_vulkan = false, int num_threads = 0, bool use_bf16 = true);
 
     // Encode audio + prompt, run the decoder prefill, return a context holding the KV cache
     // and the first generated token. `pcm` is mono float PCM in [-1, 1] at 16 kHz.

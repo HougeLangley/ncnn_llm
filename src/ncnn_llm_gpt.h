@@ -42,12 +42,29 @@ struct GenerateConfig {
     bool debug = false;
 };
 
+inline ncnn::Mat clone_kvcache_mat(const ncnn::Mat& src, ncnn::Allocator* allocator) {
+    if (src.empty()) return ncnn::Mat();
+    if (src.dims == 3 && src.w > 0) {
+        const int capacity = (int)(src.cstep / src.w);
+        ncnn::Mat dst(src.w, capacity, src.c, src.elemsize, src.elempack, allocator);
+        dst.h = src.h;
+        if (src.data && dst.data) {
+            memcpy(dst.data, src.data, src.c * src.cstep * src.elemsize);
+        }
+        return dst;
+    }
+    return src.clone(allocator);
+}
+
 class ncnn_llm_gpt_ctx {
 public:
-    virtual ~ncnn_llm_gpt_ctx() = default;
+    virtual ~ncnn_llm_gpt_ctx() {
+        kv_cache.clear();
+    }
     
     virtual std::shared_ptr<ncnn_llm_gpt_ctx> clone() const = 0;
     
+    std::shared_ptr<ncnn::UnlockedPoolAllocator> kvcache_allocator;
     KVCache kv_cache;
     int cur_token = 0;
     int position_id = 0;
@@ -57,10 +74,12 @@ class ncnn_llm_gpt_base_ctx : public ncnn_llm_gpt_ctx {
 public:
     std::shared_ptr<ncnn_llm_gpt_ctx> clone() const override {
         auto dst = std::make_shared<ncnn_llm_gpt_base_ctx>();
+        dst->kvcache_allocator = std::make_shared<ncnn::UnlockedPoolAllocator>();
+        dst->kvcache_allocator->set_size_compare_ratio(0.f);
         dst->kv_cache.resize(kv_cache.size());
         for (size_t i = 0; i < kv_cache.size(); ++i) {
-            dst->kv_cache[i].first = kv_cache[i].first;
-            dst->kv_cache[i].second = kv_cache[i].second;
+            dst->kv_cache[i].first = clone_kvcache_mat(kv_cache[i].first, dst->kvcache_allocator.get());
+            dst->kv_cache[i].second = clone_kvcache_mat(kv_cache[i].second, dst->kvcache_allocator.get());
         }
         dst->cur_token = cur_token;
         dst->position_id = position_id;
@@ -73,12 +92,20 @@ public:
     std::vector<ncnn::Mat> sconv_cache;
     std::vector<ncnn::Mat> gdr_cache;
     
+    ~qwen3_5_ctx() override {
+        sconv_cache.clear();
+        gdr_cache.clear();
+        kv_cache.clear();
+    }
+    
     std::shared_ptr<ncnn_llm_gpt_ctx> clone() const override {
         auto dst = std::make_shared<qwen3_5_ctx>();
+        dst->kvcache_allocator = std::make_shared<ncnn::UnlockedPoolAllocator>();
+        dst->kvcache_allocator->set_size_compare_ratio(0.f);
         dst->kv_cache.resize(kv_cache.size());
         for (size_t i = 0; i < kv_cache.size(); ++i) {
-            dst->kv_cache[i].first = kv_cache[i].first;
-            dst->kv_cache[i].second = kv_cache[i].second;
+            dst->kv_cache[i].first = clone_kvcache_mat(kv_cache[i].first, dst->kvcache_allocator.get());
+            dst->kv_cache[i].second = clone_kvcache_mat(kv_cache[i].second, dst->kvcache_allocator.get());
         }
         dst->sconv_cache = sconv_cache;
         dst->gdr_cache = gdr_cache;
@@ -145,7 +172,7 @@ protected:
     std::vector<nlohmann::json> tools;
 
 public:
-    ncnn_llm_gpt(const std::string& model_path, bool use_vulkan = false, int num_threads = 0, int vulkan_device = 0);
+    ncnn_llm_gpt(const std::string& model_path, bool use_vulkan = false, int num_threads = 0, int vulkan_device = 0, bool use_bf16 = true);
 
     std::shared_ptr<ncnn_llm_gpt_ctx> prefill(const std::string& input_text) const;
     std::shared_ptr<ncnn_llm_gpt_ctx> prefill(const std::string& input_text, const ncnn::Mat& bgr, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const;

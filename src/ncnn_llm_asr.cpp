@@ -1,4 +1,4 @@
-#include "ncnn_llm_asr.h"
+﻿#include "ncnn_llm_asr.h"
 
 #include <algorithm>
 #include <cctype>
@@ -8,7 +8,7 @@
 
 using nlohmann::json;
 
-ncnn_llm_asr::ncnn_llm_asr(const std::string& model_path, bool use_vulkan, int num_threads)
+ncnn_llm_asr::ncnn_llm_asr(const std::string& model_path, bool use_vulkan, int num_threads, bool use_bf16)
     : ncnn_llm_base(use_vulkan, num_threads > 0 ? num_threads : 4) {
     try {
         json config;
@@ -41,6 +41,11 @@ ncnn_llm_asr::ncnn_llm_asr(const std::string& model_path, bool use_vulkan, int n
             n->opt.use_fp16_storage = false;
             n->opt.use_fp16_arithmetic = false;
             n->opt.use_bf16_storage = false;
+        }
+
+        if (use_bf16) {
+            text_decoder_net_->opt.use_bf16_storage = true;
+            printf("[ncnn_llm_asr] BF16 storage enabled for decoder\n");
         }
 
         auto p = [&](const char* key) {
