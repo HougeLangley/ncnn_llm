@@ -28,11 +28,11 @@ def find_ncnnllm2int(custom_path=None):
     if which_path:
         return os.path.abspath(which_path)
 
-    # 3. Search in xmake cache and typical build paths
-    user_home = os.path.expanduser("~")
+    # 3. Search in cmake build directories and typical build paths
     patterns = [
-        os.path.join(user_home, "AppData", "Local", ".xmake", "cache", "packages", "**", "ncnnllm2int.exe"),
-        os.path.join(user_home, ".xmake", "cache", "packages", "**", "ncnnllm2int"),
+        os.path.join("build", "**", "ncnnllm2int*"),
+        os.path.join("build_cmake", "**", "ncnnllm2int*"),
+        os.path.join("ncnn", "build**", "tools", "quantize", "ncnnllm2int*"),
         os.path.join("..", "ncnn", "build**", "tools", "quantize", "ncnnllm2int*"),
     ]
     for pattern in patterns:

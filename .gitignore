@@ -1,7 +1,5 @@
 /assets/
-/assets/
 /.vscode/
-/.xmake/
 /build/
 /mcp
 /examples/web/generated/
@@ -19,3 +17,7 @@ examples/web_wasm/qwen3_web_wasm.wasm
 /tools/*.bin
 __pycache__/
 *.pyc
+
+/build_cmake/
+/dist/
+/.xmake/

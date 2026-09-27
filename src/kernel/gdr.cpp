@@ -1,6 +1,11 @@
+﻿// Copyright 2026 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
+
 #include "gdr.h"
 #include <cmath>
 #include <cstring>
+
+namespace ncnn {
 
 static void l2norm(const float* x, float* out, int n, int dim, float eps)
 {
@@ -37,17 +42,18 @@ static float softplusf(float x)
     return logf(1.f + expf(x));
 }
 
-static void torch_recurrent_gated_delta_rule(
+static int torch_recurrent_gated_delta_rule(
     const float* query, const float* key, const float* value,
     const float* g, const float* beta,
     float* core_attn_out,
     float* last_recurrent_state,
     int batch_size, int num_heads, int seq_len,
     int k_head_dim, int v_head_dim,
-    bool use_qk_l2norm_in_kernel)
+    bool use_qk_l2norm_in_kernel,
+    const Option& opt)
 {
-    std::vector<float> query_norm;
-    std::vector<float> key_norm;
+    Mat query_norm;
+    Mat key_norm;
 
     const float* q_ptr = query;
     const float* k_ptr = key;
@@ -55,19 +61,29 @@ static void torch_recurrent_gated_delta_rule(
     int qk_size = batch_size * num_heads * seq_len * k_head_dim;
     if (use_qk_l2norm_in_kernel)
     {
-        query_norm.resize(qk_size);
-        key_norm.resize(qk_size);
+        query_norm.create(k_head_dim, seq_len, num_heads * batch_size, 4u, opt.workspace_allocator);
+        key_norm.create(k_head_dim, seq_len, num_heads * batch_size, 4u, opt.workspace_allocator);
+        if (query_norm.empty() || key_norm.empty())
+            return -100;
 
-        l2norm(query, query_norm.data(), batch_size * num_heads * seq_len, k_head_dim, 1e-6f);
-        l2norm(key, key_norm.data(), batch_size * num_heads * seq_len, k_head_dim, 1e-6f);
+        l2norm(query, (float*)query_norm.data, batch_size * num_heads * seq_len, k_head_dim, 1e-6f);
+        l2norm(key, (float*)key_norm.data, batch_size * num_heads * seq_len, k_head_dim, 1e-6f);
 
-        q_ptr = query_norm.data();
-        k_ptr = key_norm.data();
+        q_ptr = (const float*)query_norm.data;
+        k_ptr = (const float*)key_norm.data;
     }
 
     float scale = 1.f / sqrtf((float)k_head_dim);
 
     memset(core_attn_out, 0, batch_size * num_heads * seq_len * v_head_dim * sizeof(float));
+
+    Mat kv_mem(v_head_dim, 4u, opt.workspace_allocator);
+    Mat delta(v_head_dim, 4u, opt.workspace_allocator);
+    if (kv_mem.empty() || delta.empty())
+        return -100;
+
+    float* kv_mem_ptr = (float*)kv_mem.data;
+    float* delta_ptr = (float*)delta.data;
 
     for (int t = 0; t < seq_len; t++)
     {
@@ -92,26 +108,25 @@ static void torch_recurrent_gated_delta_rule(
                     state[i] *= g_t_exp;
                 }
 
-                std::vector<float> kv_mem(v_head_dim, 0.f);
+                memset(kv_mem_ptr, 0, v_head_dim * sizeof(float));
                 for (int dv = 0; dv < v_head_dim; dv++)
                 {
                     for (int dk = 0; dk < k_head_dim; dk++)
                     {
-                        kv_mem[dv] += state[dk * v_head_dim + dv] * k_t[dk];
+                        kv_mem_ptr[dv] += state[dk * v_head_dim + dv] * k_t[dk];
                     }
                 }
 
-                std::vector<float> delta(v_head_dim);
                 for (int dv = 0; dv < v_head_dim; dv++)
                 {
-                    delta[dv] = (v_t[dv] - kv_mem[dv]) * beta_t;
+                    delta_ptr[dv] = (v_t[dv] - kv_mem_ptr[dv]) * beta_t;
                 }
 
                 for (int dk = 0; dk < k_head_dim; dk++)
                 {
                     for (int dv = 0; dv < v_head_dim; dv++)
                     {
-                        state[dk * v_head_dim + dv] += k_t[dk] * delta[dv];
+                        state[dk * v_head_dim + dv] += k_t[dk] * delta_ptr[dv];
                     }
                 }
 
@@ -127,6 +142,8 @@ static void torch_recurrent_gated_delta_rule(
             }
         }
     }
+
+    return 0;
 }
 
 GatedDeltaRule::GatedDeltaRule()
@@ -138,16 +155,16 @@ GatedDeltaRule::GatedDeltaRule()
     num_v_heads = 128;
 }
 
-int GatedDeltaRule::forward(const std::vector<ncnn::Mat>& bottom_blobs, std::vector<ncnn::Mat>& top_blobs, const ncnn::Option& opt) const
+int GatedDeltaRule::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
-    const ncnn::Mat& A_log = bottom_blobs[0];
-    const ncnn::Mat& dt_bias = bottom_blobs[1];
-    const ncnn::Mat& b = bottom_blobs[2];
-    const ncnn::Mat& a = bottom_blobs[3];
-    const ncnn::Mat& query = bottom_blobs[4];
-    const ncnn::Mat& key = bottom_blobs[5];
-    const ncnn::Mat& value = bottom_blobs[6];
-    const ncnn::Mat& initial_state = bottom_blobs[7];
+    const Mat& A_log = bottom_blobs[0];
+    const Mat& dt_bias = bottom_blobs[1];
+    const Mat& b = bottom_blobs[2];
+    const Mat& a = bottom_blobs[3];
+    const Mat& query = bottom_blobs[4];
+    const Mat& key = bottom_blobs[5];
+    const Mat& value = bottom_blobs[6];
+    const Mat& initial_state = bottom_blobs.size() > 7 ? bottom_blobs[7] : Mat();
 
     int num_heads = query.h;
     int seq_len = query.c;
@@ -156,22 +173,37 @@ int GatedDeltaRule::forward(const std::vector<ncnn::Mat>& bottom_blobs, std::vec
 
     bool use_qk_l2norm_in_kernel = true;
 
-    ncnn::Mat& top_blob = top_blobs[0];
+    Mat& top_blob = top_blobs[0];
     top_blob.create(k_head_dim, num_heads, seq_len, 4u, opt.blob_allocator);
+    if (top_blob.empty())
+        return -100;
 
-    ncnn::Mat& state_out = top_blobs[1];
-    state_out.create(v_head_dim, k_head_dim, num_heads, 4u, opt.blob_allocator);
-
-    if (top_blob.empty() || state_out.empty())
+    Mat state_out_workspace;
+    Mat& state_out = (top_blobs.size() > 1) ? top_blobs[1] : state_out_workspace;
+    if (top_blobs.size() > 1)
+    {
+        state_out.create(v_head_dim, k_head_dim, num_heads, 4u, opt.blob_allocator);
+    }
+    else
+    {
+        state_out.create(v_head_dim, k_head_dim, num_heads, 4u, opt.workspace_allocator);
+    }
+    if (state_out.empty())
         return -100;
 
     const float* query_data = (const float*)query.data;
     const float* key_data = (const float*)key.data;
     const float* value_data = (const float*)value.data;
 
-    std::vector<float> query_t(num_heads * seq_len * k_head_dim);
-    std::vector<float> key_t(num_heads * seq_len * k_head_dim);
-    std::vector<float> value_t(num_heads * seq_len * v_head_dim);
+    Mat query_t(k_head_dim, seq_len, num_heads, 4u, opt.workspace_allocator);
+    Mat key_t(k_head_dim, seq_len, num_heads, 4u, opt.workspace_allocator);
+    Mat value_t(v_head_dim, seq_len, num_heads, 4u, opt.workspace_allocator);
+    if (query_t.empty() || key_t.empty() || value_t.empty())
+        return -100;
+
+    float* query_t_data = (float*)query_t.data;
+    float* key_t_data = (float*)key_t.data;
+    float* value_t_data = (float*)value_t.data;
 
     for (int t = 0; t < seq_len; t++)
     {
@@ -181,14 +213,14 @@ int GatedDeltaRule::forward(const std::vector<ncnn::Mat>& bottom_blobs, std::vec
             {
                 int src_idx = (t * num_heads + h) * k_head_dim + d;
                 int dst_idx = (h * seq_len + t) * k_head_dim + d;
-                query_t[dst_idx] = query_data[src_idx];
-                key_t[dst_idx] = key_data[src_idx];
+                query_t_data[dst_idx] = query_data[src_idx];
+                key_t_data[dst_idx] = key_data[src_idx];
             }
             for (int d = 0; d < v_head_dim; d++)
             {
                 int src_idx = (t * num_heads + h) * v_head_dim + d;
                 int dst_idx = (h * seq_len + t) * v_head_dim + d;
-                value_t[dst_idx] = value_data[src_idx];
+                value_t_data[dst_idx] = value_data[src_idx];
             }
         }
     }
@@ -198,15 +230,20 @@ int GatedDeltaRule::forward(const std::vector<ncnn::Mat>& bottom_blobs, std::vec
     const float* A_log_data = (const float*)A_log.data;
     const float* dt_bias_data = (const float*)dt_bias.data;
 
-    std::vector<float> beta(num_heads * seq_len);
-    std::vector<float> g(num_heads * seq_len);
+    Mat beta(seq_len, num_heads, 4u, opt.workspace_allocator);
+    Mat g(seq_len, num_heads, 4u, opt.workspace_allocator);
+    if (beta.empty() || g.empty())
+        return -100;
+
+    float* beta_data = (float*)beta.data;
+    float* g_data = (float*)g.data;
 
     for (int h = 0; h < num_heads; h++)
     {
         for (int t = 0; t < seq_len; t++)
         {
             float b_val = b_data[t * num_heads + h];
-            beta[h * seq_len + t] = sigmoidf(b_val);
+            beta_data[h * seq_len + t] = sigmoidf(b_val);
         }
     }
 
@@ -220,35 +257,41 @@ int GatedDeltaRule::forward(const std::vector<ncnn::Mat>& bottom_blobs, std::vec
         {
             float a_val = a_data[t * num_heads + h];
             float sp_val = softplusf(a_val + dt_bias_val);
-            g[h * seq_len + t] = -exp_A * sp_val;
+            g_data[h * seq_len + t] = -exp_A * sp_val;
         }
     }
 
     int batch_size = 1;
 
-    std::vector<float> core_attn_out(num_heads * seq_len * v_head_dim);
-    std::vector<float> last_recurrent_state(num_heads * k_head_dim * v_head_dim);
+    Mat core_attn_out(v_head_dim, seq_len, num_heads, 4u, opt.workspace_allocator);
+    if (core_attn_out.empty())
+        return -100;
 
+    float* state_data = (float*)state_out.data;
     if (!initial_state.empty())
     {
-        memcpy(last_recurrent_state.data(), initial_state.data,
+        memcpy(state_data, initial_state.data,
                num_heads * k_head_dim * v_head_dim * sizeof(float));
     }
     else
     {
-        memset(last_recurrent_state.data(), 0,
+        memset(state_data, 0,
                num_heads * k_head_dim * v_head_dim * sizeof(float));
     }
 
-    torch_recurrent_gated_delta_rule(
-        query_t.data(), key_t.data(), value_t.data(),
-        g.data(), beta.data(),
-        core_attn_out.data(),
-        last_recurrent_state.data(),
+    int ret = torch_recurrent_gated_delta_rule(
+        query_t_data, key_t_data, value_t_data,
+        g_data, beta_data,
+        (float*)core_attn_out.data,
+        state_data,
         batch_size, num_heads, seq_len,
         k_head_dim, v_head_dim,
-        use_qk_l2norm_in_kernel);
+        use_qk_l2norm_in_kernel,
+        opt);
+    if (ret != 0)
+        return ret;
 
+    const float* core_attn_out_data = (const float*)core_attn_out.data;
     float* top_data = (float*)top_blob.data;
     for (int h = 0; h < num_heads; h++)
     {
@@ -258,105 +301,58 @@ int GatedDeltaRule::forward(const std::vector<ncnn::Mat>& bottom_blobs, std::vec
             {
                 int src_idx = (h * seq_len + t) * v_head_dim + d;
                 int dst_idx = (t * num_heads + h) * v_head_dim + d;
-                top_data[dst_idx] = core_attn_out[src_idx];
+                top_data[dst_idx] = core_attn_out_data[src_idx];
             }
         }
     }
 
-    memcpy((float*)state_out.data, last_recurrent_state.data(),
-           num_heads * k_head_dim * v_head_dim * sizeof(float));
-
     return 0;
 }
 
-ShortConv::ShortConv()
+} // namespace ncnn
+
+#if __SSE2__ || defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include "kernel/x86/gdr_x86.h"
+#include "kernel/x86/shortconv_x86.h"
+#endif
+
+namespace ncnn {
+
+static bool s_force_naive = false;
+
+static Layer* GatedDeltaRule_creator(void*)
 {
-    one_blob_only = false;
-    support_inplace = false;
-}
-
-int ShortConv::forward(const std::vector<ncnn::Mat>& bottom_blobs, std::vector<ncnn::Mat>& top_blobs, const ncnn::Option& opt) const
-{
-    const ncnn::Mat& weight_mat = bottom_blobs[0];
-    const ncnn::Mat& mixed_qkv = bottom_blobs[1];
-    const ncnn::Mat& conv_state = bottom_blobs[2];
-
-    int seq_len = mixed_qkv.h;
-    int groups = mixed_qkv.w;
-    int kernel_size = weight_mat.w;
-
-    ncnn::Mat stated_mixed_qkv;
-    if (conv_state.empty())
-    {
-        stated_mixed_qkv.create(groups, kernel_size - 1 + seq_len, 4u, opt.blob_allocator);
-        memset(stated_mixed_qkv.row(0), 0, (kernel_size - 1) * groups * sizeof(float));
-        memcpy(stated_mixed_qkv.row(kernel_size - 1), mixed_qkv, mixed_qkv.h * groups * sizeof(float));
-    }
-    else
-    {
-        stated_mixed_qkv.create(groups, conv_state.h + seq_len, 4u, opt.blob_allocator);
-        memcpy(stated_mixed_qkv.row(0), conv_state, conv_state.h * groups * sizeof(float));
-        memcpy(stated_mixed_qkv.row(conv_state.h), mixed_qkv, mixed_qkv.h * groups * sizeof(float));
-    }
-
-    int state_len = kernel_size;
-    int total_len = conv_state.empty() ? (kernel_size - 1 + seq_len) : (conv_state.h + seq_len);
-    ncnn::Mat last_conv_state(groups, state_len, 4u, opt.blob_allocator);
-    memcpy(last_conv_state.data, stated_mixed_qkv.row(total_len - state_len),
-           state_len * groups * sizeof(float));
-
-    ncnn::Mat& top_blob = top_blobs[0];
-    top_blob.create(groups, seq_len, 4u, opt.blob_allocator);
-
-    #pragma omp parallel for num_threads(opt.num_threads)
-    for (int g = 0; g < groups; g++)
-    {
-        const float* w_ptr = weight_mat.channel(g);
-
-        for (int i = 0; i < seq_len; i++)
-        {
-            float sum = 0.f;
-
-            int prefix_len = conv_state.empty() ? (kernel_size - 1) : conv_state.h;
-            int base = prefix_len + i;
-
-            for (int k = 0; k < kernel_size; k++)
-            {
-                int src_i = base - (kernel_size - 1) + k;
-                sum += stated_mixed_qkv.row(src_i)[g] * w_ptr[k];
-            }
-
-            top_blob.row(i)[g] = sum * (1.f / (1.f + expf(-sum)));
-        }
-    }
-
-    top_blobs[1] = last_conv_state;
-
-    return 0;
-}
-
-static ncnn::Layer* GatedDeltaRule_creator(void*)
-{
+#if __SSE2__ || defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    if (!s_force_naive)
+        return new GatedDeltaRule_x86;
+#endif
     return new GatedDeltaRule;
 }
 
-static void GatedDeltaRule_destroyer(ncnn::Layer* layer, void*)
+static void GatedDeltaRule_destroyer(Layer* layer, void*)
 {
     delete layer;
 }
 
-static ncnn::Layer* ShortConv_creator(void*)
+static Layer* ShortConv_creator(void*)
 {
+#if __SSE2__ || defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    if (!s_force_naive)
+        return new ShortConv_x86;
+#endif
     return new ShortConv;
 }
 
-static void ShortConv_destroyer(ncnn::Layer* layer, void*)
+static void ShortConv_destroyer(Layer* layer, void*)
 {
     delete layer;
 }
 
-void register_gdr_layers(ncnn::Net& net)
+} // namespace ncnn
+
+void register_gdr_layers(ncnn::Net& net, bool force_naive)
 {
-    net.register_custom_layer("GatedDeltaRule", GatedDeltaRule_creator, GatedDeltaRule_destroyer);
-    net.register_custom_layer("ShortConv", ShortConv_creator, ShortConv_destroyer);
+    ncnn::s_force_naive = force_naive;
+    net.register_custom_layer("GatedDeltaRule", ncnn::GatedDeltaRule_creator, ncnn::GatedDeltaRule_destroyer);
+    net.register_custom_layer("ShortConv", ncnn::ShortConv_creator, ncnn::ShortConv_destroyer);
 }

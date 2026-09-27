@@ -68,7 +68,8 @@ static double run_bench_true_sliding(int L, int num_heads, int head_dim, int win
     ncnn::Mat top(head_dim, L, num_heads);
 
     auto run_kernel = [&]() {
-        #pragma omp parallel for num_threads(num_threads)
+        int nt = num_threads;
+        #pragma omp parallel for num_threads(nt)
         for (int h = 0; h < num_heads; ++h) {
             const ncnn::Mat q_head = q.channel(h);
             const ncnn::Mat k_head = k.channel(h);

@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
-  <img alt="Build" src="https://img.shields.io/badge/build-xmake-4c8eda">
+  <img alt="Build" src="https://img.shields.io/badge/build-cmake-064f8c">
   <img alt="Backend" src="https://img.shields.io/badge/backend-ncnn-orange">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Android-lightgrey">
 </p>
@@ -41,7 +41,8 @@
 - 提供 Laya / Laya-Multilingual 判别器快速决策示例
 - 提供文本嵌入和多模态嵌入 API
 - 支持 BPE 和 Unigram 分词器
-- 使用 xmake 构建，示例程序保持小而独立
+- 基于 CMake 统一构建与工程管理，内置丰富示例程序与 CTest 自动化测试
+- 高性能自定义算子（GatedDeltaRule 与 ShortConv）遵循 ncnn 正式算子架构，统一依托 workspace_allocator / blob_allocator 内存池管理临时与输出内存，并通过 AVX-512 / AVX / SSE SIMD 高效加速
 
 ## 支持模型
 
@@ -61,28 +62,44 @@
 
 ## 快速开始
 
-### 1. 依赖
+### 1. 环境依赖
 
-- `xmake`
-- 从 `master` 分支构建的 ncnn
+- 支持 C++20 的编译器 (MSVC 2019+, GCC 10+, Clang 11+)
+- CMake >= 3.15
+- Vulkan SDK（可选，用于 Vulkan GPU 加速）
 
 ### 2. 克隆仓库
 
+递归克隆项目仓库（参考 LiteOCR、wan-ncnn-vulkan 等项目，内嵌 ncnn 官方算子支持）：
+
 ```bash
-git clone https://github.com/futz12/ncnn_llm.git
+git clone --recursive https://github.com/futz12/ncnn_llm.git
 cd ncnn_llm
+```
+
+如果克隆时未加 `--recursive`，请执行以下命令拉取子模块：
+
+```bash
+git submodule update --init --recursive
 ```
 
 ### 3. 构建
 
 ```bash
-xmake build
+# 配置工程（可通过 -DNCNN_LLM_ENABLE_VULKAN=ON/OFF 控制 Vulkan 支持）
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DNCNN_LLM_ENABLE_VULKAN=ON
+
+# 编译
+cmake --build build --config Release -j
+
+# 运行单元测试
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-只构建单个 target：
+构建单个目标（例如 `llm_ncnn_run`）：
 
 ```bash
-xmake build llm_ncnn_run
+cmake --build build --config Release --target llm_ncnn_run
 ```
 
 ### 4. 下载模型
@@ -107,20 +124,20 @@ assets/
 `llm_ncnn_run` 是主要的交互式示例，支持文本模型和视觉语言模型。
 
 ```bash
-xmake run llm_ncnn_run --model ./assets/qwen3_0.6b
+./build/llm_ncnn_run --model ./assets/qwen3_0.6b
 ```
 
 指定运行参数：
 
 ```bash
-xmake run llm_ncnn_run --model ./assets/qwen3_0.6b --threads 4
-xmake run llm_ncnn_run --model ./assets/qwen3_0.6b --vulkan --vulkan-device 0
+./build/llm_ncnn_run --model ./assets/qwen3_0.6b --threads 4
+./build/llm_ncnn_run --model ./assets/qwen3_0.6b --vulkan --vulkan-device 0
 ```
 
 视觉语言输入：
 
 ```bash
-xmake run llm_ncnn_run --model ./assets/qwen2.5_vl_3b --image ./assets/test.jpg
+./build/llm_ncnn_run --model ./assets/qwen2.5_vl_3b --image ./assets/test.jpg
 ```
 
 ### CLI 选项
@@ -169,7 +186,7 @@ ncnnllm2int decoder.ncnn.param decoder.ncnn.bin decoder_int8.ncnn.param decoder_
 ### 运行量化模型
 
 ```bash
-xmake run llm_ncnn_run --model ./assets/qwen3_0.6b_int8 --threads 8
+./build/llm_ncnn_run --model ./assets/qwen3_0.6b_int8 --threads 8
 ```
 > 注：Gemm weight block quantization 当前在 CPU 后端提供高效向量化计算（支持 AVX2 / AVX-VNNI / ARM 等），运行时检测到量化层时会自动在 CPU 执行。
 
@@ -178,8 +195,8 @@ xmake run llm_ncnn_run --model ./assets/qwen3_0.6b_int8 --threads 8
 GLM-OCR 使用专用的图像 prefill 路径，并复用共享文本解码运行时。
 
 ```bash
-xmake build ocr_main
-xmake run ocr_main --model ./assets/glm_ocr --image ./test_ocr.png --prompt "Read the text in the image."
+cmake --build build --config Release --target ocr_main
+./build/ocr_main --model ./assets/glm_ocr --image ./test_ocr.png --prompt "Read the text in the image."
 ```
 
 输出示例：
@@ -212,10 +229,10 @@ python export/laya_export.py --model-dir ./models/laya_multilingual --output-dir
 ### CLI 推理
 
 ```bash
-xmake build laya_main
+cmake --build build --config Release --target laya_main
 
 # 运行 INT8 量化多语言判别器
-xmake run laya_main --model ./assets/laya_multilingual_int8 --json ./examples/laya_multilingual_request.json --threads 4
+./build/laya_main --model ./assets/laya_multilingual_int8 --json ./examples/laya_multilingual_request.json --threads 4
 ```
 
 ### C++ API
@@ -253,15 +270,15 @@ std::cout << res.dump(2) << std::endl;
 ### 文本嵌入
 
 ```bash
-xmake build embedding_main
-xmake run embedding_main --model ./assets/jina-embeddings-v5-text-nano
+cmake --build build --config Release --target embedding_main
+./build/embedding_main --model ./assets/jina-embeddings-v5-text-nano
 ```
 
 ### CLIP 多模态嵌入
 
 ```bash
-xmake build clip_main
-xmake run clip_main --model ./assets/jina_clip_v2 --image ./assets/ganyu.jpg
+cmake --build build --config Release --target clip_main
+./build/clip_main --model ./assets/jina_clip_v2 --image ./assets/ganyu.jpg
 ```
 
 ### C++ API
@@ -291,19 +308,20 @@ if (embed.supports_image()) {
 | `unigram_main` | Unigram 分词器示例 |
 | `benchllm` | LLM 性能测试 |
 | `test_llm` | 单元测试 |
+| `test_bf16` | BF16 精度测试 |
+| `test_kernel` | GDR 与 ShortConv 算子内存池及 SIMD 优化单元测试 |
 
-构建并运行测试：
+运行单元测试：
 
 ```bash
-xmake build test_llm
-xmake run test_llm
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 运行 benchmark：
 
 ```bash
-xmake build benchllm
-xmake run benchllm [loop_count] [num_threads] [powersave] [gpu_device] [cooling_down] [seqlen]
+cmake --build build --config Release --target benchllm
+./build/benchllm [loop_count] [num_threads] [powersave] [gpu_device] [cooling_down] [seqlen]
 ```
 
 ## 模型库
@@ -370,7 +388,6 @@ ncnn_llm/
 │   ├── ncnn_text_runtime.* # 共享文本解码辅助函数
 │   └── utils/              # 分词器、图像、RoPE、prompt 工具
 ├── tests/                  # 单元测试
-└── xmake.lua               # 构建配置
 ```
 
 ## 路线图

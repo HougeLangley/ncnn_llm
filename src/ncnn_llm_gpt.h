@@ -24,7 +24,7 @@
 #include "utils/tokenizer/bpe_tokenizer.h"
 #include "utils/rope_embed.h"
 #include "utils/prompt.h"
-#include "utils/gdr.h"
+#include "kernel/gdr.h"
 #include "utils/image_utils.h"
 
 using nlohmann::json;
