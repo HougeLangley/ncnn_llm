@@ -448,3 +448,32 @@ void generate_hunyuan_xdrope_cos_sin(const std::vector<int>* pos4,
         }
     }
 }
+
+void generate_rope_embed_cache_3d(int seqlen,
+                                  int head_dim,
+                                  float rope_theta,
+                                  ncnn::Mat& cos_cache,
+                                  ncnn::Mat& sin_cache)
+{
+    const int half_dim = head_dim / 2;
+    cos_cache.create(half_dim, seqlen, 1, sizeof(float));
+    sin_cache.create(half_dim, seqlen, 1, sizeof(float));
+
+    std::vector<float> inv_freq(half_dim);
+    for (int i = 0; i < half_dim; ++i)
+    {
+        inv_freq[i] = 1.0f / std::pow(rope_theta, static_cast<float>(2 * i) / static_cast<float>(head_dim));
+    }
+
+    for (int i = 0; i < seqlen; ++i)
+    {
+        float* r_cos = cos_cache.row(i);
+        float* r_sin = sin_cache.row(i);
+        for (int j = 0; j < half_dim; ++j)
+        {
+            const float angle = static_cast<float>(i) * inv_freq[j];
+            r_cos[j] = std::cos(angle);
+            r_sin[j] = std::sin(angle);
+        }
+    }
+}

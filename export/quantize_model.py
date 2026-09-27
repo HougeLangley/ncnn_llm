@@ -1,5 +1,5 @@
 # Copyright (c) 2026 ncnn_llm authors. All rights reserved.
-# Use of this source code is governed by a BSD-style license.
+# Use of this source code is governed by a Apache License 2.0.
 
 import argparse
 import glob
@@ -86,6 +86,10 @@ def get_quantizable_targets(config):
         targets.append(("text_encoder", "text_encoder_param", "text_encoder_bin"))
     if "vision_encoder_param" in params and "vision_encoder_bin" in params and model_type == "clip":
         targets.append(("vision_encoder", "vision_encoder_param", "vision_encoder_bin"))
+
+    # 5. Laya decision backbone
+    if "backbone_param" in params and "backbone_bin" in params:
+        targets.append(("backbone", "backbone_param", "backbone_bin"))
 
     return targets
 

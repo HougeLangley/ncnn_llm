@@ -5,7 +5,7 @@
 <h1 align="center">ncnn_llm</h1>
 
 <p align="center">
-  <b>基于 ncnn 的 LLM、VLM、OCR、翻译和嵌入模型推理运行时。</b>
+  <b>基于 ncnn 的 LLM、VLM、OCR、判别器和嵌入模型推理运行时。</b>
 </p>
 
 <p align="center">
@@ -38,7 +38,7 @@
 - 支持 Qwen / MiniCPM 风格的 LLM
 - 支持 Qwen VL 图文输入
 - 提供 GLM-OCR 图像文字识别示例
-- 提供 NLLB 翻译示例
+- 提供 Laya / Laya-Multilingual 判别器快速决策示例
 - 提供文本嵌入和多模态嵌入 API
 - 支持 BPE 和 Unigram 分词器
 - 使用 xmake 构建，示例程序保持小而独立
@@ -55,7 +55,7 @@
 | OCR | GLM-OCR | 已支持 | OCR |
 | OCR | HunyuanOCR | 已支持 | OCR |
 | ASR | Qwen3 ASR | 已支持 | ASR |
-| 翻译 | NLLB | 已支持 | 翻译 |
+| 判别器 | Laya / Laya-Multilingual | 已支持 | System 1 极速决策引擎 (意图分类/严重度打分/强化学习升级) |
 | 嵌入 | Jina-Embeddings-v5-Text-Nano | 已支持 | 768 维文本嵌入 |
 | 嵌入 | Jina-CLIP-v2 | 已支持 | 1024 维文本 + 图像嵌入 |
 
@@ -189,6 +189,63 @@ Generating text:
 Hello World 123
 ```
 
+## 判别器 / 快速决策 (Laya)
+
+`ncnn_llm_laya` 支持 Convai 的 **Laya**（基于 ModernBERT-large）与 **Laya-Multilingual**（基于 mmBERT-base）判别器。每个模型由 `backbone`、`scorer` 和 `act_head` 三个 ncnn 子模型组成，用于 System 1 级别的意图识别、严重度打分与强化学习代理升级判断。
+
+### 导出模型
+
+```bash
+# 先将 Hugging Face 源模型下载到本地目录
+huggingface-cli download convaiinnovations/laya --local-dir ./models/laya
+
+# 导出英文版 Laya (BF16 & INT8 block quantization)
+python export/laya_export.py --model-dir ./models/laya --output-dir ./assets/laya --int8-dir ./assets/laya_int8
+
+# 下载并导出多语言版 Laya-Multilingual
+huggingface-cli download convaiinnovations/laya-multilingual --local-dir ./models/laya_multilingual
+python export/laya_export.py --model-dir ./models/laya_multilingual --output-dir ./assets/laya_multilingual --int8-dir ./assets/laya_multilingual_int8
+```
+
+`--model-dir` 必须是已经下载的本地源模型目录；导出脚本会在该目录中加载 `rl_agent_api.py` 和 `tokenizer/`。
+
+### CLI 推理
+
+```bash
+xmake build laya_main
+
+# 运行 INT8 量化多语言判别器
+xmake run laya_main --model ./assets/laya_multilingual_int8 --json ./examples/laya_multilingual_request.json --threads 4
+```
+
+### C++ API
+
+```cpp
+#include "ncnn_llm_laya.h"
+
+ncnn_llm_laya laya("./assets/laya_multilingual_int8", false, 4, 0, true);
+
+std::string state = "包裹在运输途中破损了，里面的东西碎了一地，快递员还不承认，要求立刻赔偿退款并道歉！";
+nlohmann::json questions = {
+    {"intent", {
+        {"type", "choice"},
+        {"instructions", "判断用户的核心意图类别"},
+        {"criteria", {
+            {"refund", "要求退款或赔偿"},
+            {"logistics", "询问物流进度或包裹位置"},
+            {"feedback", "产品普通反馈或建议"}
+        }}
+    }},
+    {"urgent", {
+        {"type", "noul"},
+        {"instructions", "用户的情绪是否非常愤怒且需要紧急处理？"}
+    }}
+};
+
+nlohmann::json res = laya.system_one_json(state, questions);
+std::cout << res.dump(2) << std::endl;
+```
+
 ## 嵌入模型
 
 `ncnn_embedding` 为文本嵌入和 CLIP 风格的图文嵌入提供统一 API。
@@ -230,7 +287,7 @@ if (embed.supports_image()) {
 | `ocr_main` | GLM-OCR 推理 |
 | `embedding_main` | 文本嵌入推理 |
 | `clip_main` | CLIP 图文嵌入推理 |
-| `nllb_main` | NLLB 翻译示例 |
+| `laya_main` | Laya / Laya-Multilingual 判别器推理 |
 | `unigram_main` | Unigram 分词器示例 |
 | `benchllm` | LLM 性能测试 |
 | `test_llm` | 单元测试 |
@@ -302,10 +359,12 @@ ncnn_llm/
 │   ├── ocr_main.cpp        # OCR 示例
 │   ├── embedding_main.cpp  # 文本嵌入示例
 │   ├── clip_main.cpp       # CLIP 示例
-│   └── nllb_main.cpp       # 翻译示例
+│   ├── laya_main.cpp       # Laya 判别器示例
+│   └── asr_main.cpp        # ASR 示例
 ├── export/                 # 导出脚本
 ├── src/                    # 核心运行时
 │   ├── ncnn_llm_gpt.*      # LLM / VLM 运行时
+│   ├── ncnn_llm_laya.*     # Laya 判别器运行时
 │   ├── ncnn_llm_ocr.*      # OCR 图像 prefill + 共享解码
 │   ├── ncnn_embedding.*    # 嵌入模型运行时
 │   ├── ncnn_text_runtime.* # 共享文本解码辅助函数

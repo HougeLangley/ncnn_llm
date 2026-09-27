@@ -83,3 +83,9 @@ void generate_hunyuan_xdrope_cos_sin(const std::vector<int>* pos4,
                                      float alpha,
                                      ncnn::Mat& cos_cache,
                                      ncnn::Mat& sin_cache);
+// 3D RoPE cache (w = head_dim / 2, h = seqlen, c = 1) for models like ModernBERT / Laya
+void generate_rope_embed_cache_3d(int seqlen,
+                                  int head_dim,
+                                  float rope_theta,
+                                  ncnn::Mat& cos_cache,
+                                  ncnn::Mat& sin_cache);

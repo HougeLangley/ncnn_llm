@@ -12,6 +12,9 @@ examples/web_wasm/qwen3_web_wasm.wasm
 /R-C.jpg
 /test_ocr.png
 
+/laya_hf/
+/laya_multilingual_hf/
+
 /tools/*.exe
 /tools/*.bin
 __pycache__/

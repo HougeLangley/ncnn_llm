@@ -7,18 +7,22 @@
 
 // ---------------- I/O helpers ----------------
 std::vector<std::string> BpeTokenizer::LoadVocab(const std::string& vocab_path) {
-    std::ifstream ifs(vocab_path);
+    std::ifstream ifs(vocab_path, std::ios::binary);
     if (!ifs.is_open()) {
         throw std::runtime_error("Failed to open vocab file: " + vocab_path);
     }
     std::vector<std::string> vocab;
-    vocab.reserve(50000);
+    vocab.reserve(260000);
     std::string line;
     while (std::getline(ifs, line)) {
-        if (!line.empty()) {
-            if (line.back() == '\r') {
-                line.pop_back(); // strip CR
-            }
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line == "\\n") {
+            vocab.push_back("\n");
+        } else if (line == "\\r") {
+            vocab.push_back("\r");
+        } else {
             vocab.push_back(line);
         }
     }

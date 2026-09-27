@@ -153,3 +153,17 @@ target("asr_main")
 
     set_rundir("$(projectdir)/")
 
+
+target("laya_main")
+    set_kind("binary")
+    add_includedirs("examples/")
+    add_files("examples/laya_main.cpp")
+    add_deps("ncnn_llm")
+    add_packages("ncnn", "nlohmann_json")
+
+    if is_plat("windows", "mingw") then
+        add_syslinks("shell32")
+    end
+
+    set_rundir("$(projectdir)/")
+

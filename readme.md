@@ -5,7 +5,7 @@
 <h1 align="center">ncnn_llm</h1>
 
 <p align="center">
-  <b>LLM, VLM, OCR, translation, and embedding inference on top of ncnn.</b>
+  <b>LLM, VLM, OCR, discriminator, and embedding inference on top of ncnn.</b>
 </p>
 
 <p align="center">
@@ -38,7 +38,7 @@ The project started from **nihui's** experimental ncnn `kvcache` work and expand
 - Qwen / MiniCPM style LLM support
 - Qwen VL image input support
 - GLM-OCR image-to-text example
-- NLLB translation example
+- Laya / Laya-Multilingual fast decision discriminator example
 - Text and multimodal embedding APIs
 - BPE and Unigram tokenizer support
 - xmake-based build with small standalone examples
@@ -55,7 +55,7 @@ The project started from **nihui's** experimental ncnn `kvcache` work and expand
 | OCR | GLM-OCR | Supported | OCR |
 | OCR | HunyuanOCR | Supported | OCR |
 | ASR | Qwen3 ASR | Supported | ASR |
-| Translation | NLLB | Supported | Translation |
+| Discriminator | Laya / Laya-Multilingual | Supported | System 1 fast decision engine (intent choice/scoring/RL escalation) |
 | Embedding | Jina-Embeddings-v5-Text-Nano | Supported | 768-dim text embeddings |
 | Embedding | Jina-CLIP-v2 | Supported | 1024-dim text + image embeddings |
 
@@ -189,6 +189,62 @@ Generating text:
 Hello World 123
 ```
 
+## Discriminator / Fast Decision (Laya)
+
+`ncnn_llm_laya` supports Convai's **Laya** (ModernBERT-large based) and **Laya-Multilingual** (mmBERT-base based) discriminators. Each model is split into three ncnn submodels, `backbone`, `scorer`, and `act_head`, for System 1 intent classification, scoring, and RL agent escalation.
+
+### Model Export
+
+```bash
+# Download the Hugging Face source model to a local directory first
+huggingface-cli download convaiinnovations/laya --local-dir ./models/laya
+
+# Export English Laya (BF16 & INT8 block quantization)
+python export/laya_export.py --model-dir ./models/laya --output-dir ./assets/laya --int8-dir ./assets/laya_int8
+
+# Download and export Laya-Multilingual
+huggingface-cli download convaiinnovations/laya-multilingual --local-dir ./models/laya_multilingual
+python export/laya_export.py --model-dir ./models/laya_multilingual --output-dir ./assets/laya_multilingual --int8-dir ./assets/laya_multilingual_int8
+```
+
+`--model-dir` must point to a downloaded local source model containing `rl_agent_api.py` and `tokenizer/`.
+
+### CLI Inference
+
+```bash
+xmake build laya_main
+
+# Run INT8 quantized multilingual discriminator
+xmake run laya_main --model ./assets/laya_multilingual_int8 --json ./examples/laya_multilingual_request.json --threads 4
+```
+
+### C++ API
+
+```cpp
+#include "ncnn_llm_laya.h"
+
+ncnn_llm_laya laya("./assets/laya_multilingual_int8", false, 4, 0, true);
+
+std::string state = "My package arrived broken and damaged, and the courier was rude. I demand an immediate refund!";
+nlohmann::json questions = {
+    {"intent", {
+        {"type", "choice"},
+        {"instructions", "Identify primary user intent"},
+        {"criteria", {
+            {"refund", "Asking for refund or compensation"},
+            {"logistics", "Tracking package status"}
+        }}
+    }},
+    {"urgent", {
+        {"type", "noul"},
+        {"instructions", "Is the user very angry requiring urgent escalation?"}
+    }}
+};
+
+nlohmann::json res = laya.system_one_json(state, questions);
+std::cout << res.dump(2) << std::endl;
+```
+
 ## Embeddings
 
 `ncnn_embedding` provides a common API for text embeddings and CLIP-style text-image embeddings.
@@ -230,7 +286,7 @@ if (embed.supports_image()) {
 | `ocr_main` | GLM-OCR inference |
 | `embedding_main` | Text embedding inference |
 | `clip_main` | CLIP text-image embedding inference |
-| `nllb_main` | NLLB translation example |
+| `laya_main` | Laya / Laya-Multilingual discriminator inference |
 | `unigram_main` | Unigram tokenizer example |
 | `benchllm` | LLM benchmark |
 | `test_llm` | Unit tests |
@@ -302,10 +358,12 @@ ncnn_llm/
 │   ├── ocr_main.cpp        # OCR example
 │   ├── embedding_main.cpp  # Text embedding example
 │   ├── clip_main.cpp       # CLIP example
-│   └── nllb_main.cpp       # Translation example
+│   ├── laya_main.cpp       # Laya discriminator example
+│   └── asr_main.cpp        # ASR example
 ├── export/                 # Export scripts
 ├── src/                    # Core runtime
 │   ├── ncnn_llm_gpt.*      # LLM / VL runtime
+│   ├── ncnn_llm_laya.*     # Laya discriminator runtime
 │   ├── ncnn_llm_ocr.*      # OCR image prefill + shared decode
 │   ├── ncnn_embedding.*    # Embedding runtime
 │   ├── ncnn_text_runtime.* # Shared text decode helpers

@@ -1,0 +1,32 @@
+{
+  "state": "Customer: My package has not arrived yet and tracking says delayed for 5 days. Agent: I apologize for the delay. Let me check the shipment status right away.",
+  "questions": {
+    "intent": {
+      "type": "choice",
+      "instructions": "What is the primary customer intent?",
+      "criteria": {
+        "logistics": "inquiring about package delivery and shipping tracking",
+        "refund": "demanding payment refund or money back",
+        "product_feedback": "providing review or product quality complaints"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this customer issue?",
+      "criteria": [
+        "low: routine question, can be answered within 24 hours",
+        "medium: package delayed, needs follow up today",
+        "high: urgent issue requiring supervisor intervention",
+        "critical: severe emergency or legal dispute"
+      ]
+    },
+    "refund_demanded": {
+      "type": "noul",
+      "instructions": "Does the customer explicitly demand a refund in the conversation?",
+      "criteria": {
+        "false": "no refund request stated yet",
+        "true": "customer explicitly asks for money back"
+      }
+    }
+  }
+}
