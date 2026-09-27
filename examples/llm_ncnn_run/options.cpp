@@ -53,7 +53,7 @@ Options parse_options(int argc, char** argv) {
                 std::exit(2);
             }
             opt.image_path = argv[++i];
-        } else if (a == "--use-vulkan") {
+        } else if (a == "--use-vulkan" || a == "--vulkan") {
             opt.use_vulkan = true;
         } else if (a == "--vulkan-device") {
             if (i + 1 >= argc) {

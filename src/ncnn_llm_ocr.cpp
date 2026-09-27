@@ -65,6 +65,15 @@ ncnn_llm_ocr::ncnn_llm_ocr(const std::string& model_path, bool use_vulkan, int n
         text_embed_net_->load_param(text_embed_param.c_str());
         text_embed_net_->load_model(text_embed_bin.c_str());
         text_decoder_net_->load_param(text_decoder_param.c_str());
+        if (use_vulkan) {
+            for (const auto* layer : text_decoder_net_->layers()) {
+                if (layer && !layer->support_vulkan) {
+                    printf("[ncnn_llm_ocr] Notice: decoder contains layers not supported by Vulkan. Switching decoder to CPU.\n");
+                    text_decoder_net_->opt.use_vulkan_compute = false;
+                    break;
+                }
+            }
+        }
         text_decoder_net_->load_model(text_decoder_bin.c_str());
         lm_head_net_->load_param(lm_head_param.c_str());
         lm_head_net_->load_model(lm_head_bin.c_str());

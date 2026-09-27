@@ -282,6 +282,41 @@ bool test_model_context_memory() {
     return true;
 }
 
+bool test_model_int8_inference() {
+    std::vector<std::string> int8_models = {
+        "qwen3_0.6b_int8",
+        "minicpm4_0.5b_int8",
+        "qwen3.5_0.8b_int8",
+        "youtu_llm_int8"
+    };
+
+    bool tested_any = false;
+    for (const auto& name : int8_models) {
+        if (!has_model(name)) continue;
+
+        tested_any = true;
+        ncnn_llm_gpt model(get_model_path(name));
+
+        std::string prompt = apply_chat_template({{"user", "Hello"}}, {}, true, false);
+        auto ctx = model.prefill(prompt);
+
+        std::string response;
+        GenerateConfig cfg;
+        cfg.max_new_tokens = 16;
+        ctx = model.generate(ctx, cfg, [&response](const std::string& token) {
+            response += token;
+        });
+
+        TEST_ASSERT(!response.empty(), "Response from int8 model should not be empty: " + name);
+    }
+
+    if (!tested_any) {
+        std::cout << "(skipped - no int8 models found) ";
+    }
+
+    return true;
+}
+
 int main() {
     TestRunner runner;
 
@@ -302,6 +337,7 @@ int main() {
 
     runner.add_test("model_tool_calling", test_model_tool_calling);
     runner.add_test("model_context_memory", test_model_context_memory);
+    runner.add_test("model_int8_inference", test_model_int8_inference);
 
     return runner.run_all();
 }

@@ -142,6 +142,37 @@ User: Hello
 Assistant: Hello! How can I help you today?
 ```
 
+## 模型量化 (INT8 Block Quantization)
+
+`ncnn_llm` 支持基于 ncnn 最新 Gemm block quant 特性的 INT8 量化推理。通过量化 Decoder 权重（保持 LM Head / Proj Out 原始精度以确保生成质量），大幅减少内存占用并提升 CPU 解码吞吐量。
+
+以 Qwen3-0.6B 为例（Intel i9-13900HX）：
+- **体积压缩**：Decoder 权重从 840 MB 降低至 446 MB（减少约 47%）。
+- **推理提速**：CPU 解码速度从 17.0 tokens/s 提升至 32.0 tokens/s（提升 71.9%），Prefill 耗时缩短 42%。
+- **生成精度**：与原模型输出完全一致，无精度退化。
+
+### 导出量化模型
+
+使用 ncnn 自带的量化工具进行量化（脚本会自动寻找编译好的 `ncnnllm2int` 工具）：
+
+```bash
+# 自动量化单个模型目录并生成 model.json 与资产文件
+python export/quantize_model.py --model ./assets/qwen3_0.6b --output ./assets/qwen3_0.6b_int8 --bits 8 --block 64
+
+# 或一键批量量化 assets 目录下的所有模型
+python export/quantize_model.py --all --bits 8 --block 64
+
+# 或直接对指定 param / bin 文件量化
+ncnnllm2int decoder.ncnn.param decoder.ncnn.bin decoder_int8.ncnn.param decoder_int8.ncnn.bin bits=8 block=64 method=minmax
+```
+
+### 运行量化模型
+
+```bash
+xmake run llm_ncnn_run --model ./assets/qwen3_0.6b_int8 --threads 8
+```
+> 注：Gemm weight block quantization 当前在 CPU 后端提供高效向量化计算（支持 AVX2 / AVX-VNNI / ARM 等），运行时检测到量化层时会自动在 CPU 执行。
+
 ## OCR
 
 GLM-OCR 使用专用的图像 prefill 路径，并复用共享文本解码运行时。
@@ -288,7 +319,7 @@ ncnn_llm/
 - 保持 decoder 和 KV cache 运行时在不同模型族之间共享
 - 扩展更多模型架构和分词器支持
 - 提升 Vulkan 和 CPU 推理性能
-- 增加 INT8 量化支持
+- [x] 增加 INT8 量化支持 (Gemm Block Quantization)
 - 更完整地文档化模型导出流程
 
 随着运行时演进，旧导出脚本可能会过时。建议优先参考最新模型示例和 `model.json` 文件。

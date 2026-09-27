@@ -11,3 +11,8 @@ examples/web_wasm/qwen3_web_wasm.wasm
 /.trae/
 /R-C.jpg
 /test_ocr.png
+
+/tools/*.exe
+/tools/*.bin
+__pycache__/
+*.pyc

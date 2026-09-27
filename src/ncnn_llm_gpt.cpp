@@ -83,6 +83,15 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
         register_gdr_layers(*decoder_net);
 
         decoder_net->load_param(decoder_param.c_str());
+        if (use_vulkan) {
+            for (const auto* layer : decoder_net->layers()) {
+                if (layer && !layer->support_vulkan) {
+                    printf("[ncnn_llm_gpt] Notice: decoder contains layers not supported by Vulkan (such as block-quantized INT8 Gemm). Switching decoder to CPU.\n");
+                    decoder_net->opt.use_vulkan_compute = false;
+                    break;
+                }
+            }
+        }
         decoder_net->load_model(decoder_bin.c_str());
         embed_net->load_param(embed_param.c_str());
         embed_net->load_model(embed_bin.c_str());

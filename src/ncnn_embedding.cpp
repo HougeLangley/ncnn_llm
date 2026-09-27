@@ -77,6 +77,15 @@ ncnn_embedding::ncnn_embedding(const std::string& model_path, bool use_vulkan, i
         printf("  text encoder bin: %s\n", encoder_bin.c_str());
 
         text_encoder_net->load_param(encoder_param.c_str());
+        if (use_vulkan_) {
+            for (const auto* layer : text_encoder_net->layers()) {
+                if (layer && !layer->support_vulkan) {
+                    printf("[ncnn_embedding] Notice: text encoder contains layers not supported by Vulkan. Switching to CPU.\n");
+                    text_encoder_net->opt.use_vulkan_compute = false;
+                    break;
+                }
+            }
+        }
         text_encoder_net->load_model(encoder_bin.c_str());
 
         if (model_type_ == "clip") {
@@ -85,6 +94,15 @@ ncnn_embedding::ncnn_embedding(const std::string& model_path, bool use_vulkan, i
             printf("  vision encoder param: %s\n", vision_param.c_str());
             printf("  vision encoder bin: %s\n", vision_bin.c_str());
             vision_encoder_net->load_param(vision_param.c_str());
+            if (use_vulkan_) {
+                for (const auto* layer : vision_encoder_net->layers()) {
+                    if (layer && !layer->support_vulkan) {
+                        printf("[ncnn_embedding] Notice: vision encoder contains layers not supported by Vulkan. Switching to CPU.\n");
+                        vision_encoder_net->opt.use_vulkan_compute = false;
+                        break;
+                    }
+                }
+            }
             vision_encoder_net->load_model(vision_bin.c_str());
         }
 

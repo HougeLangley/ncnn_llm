@@ -1,4 +1,4 @@
-﻿#include <iostream>
+#include <iostream>
 #include <string>
 #include <vector>
 #include <iomanip>
@@ -66,12 +66,22 @@ RunResult test_inference(const std::string& model_path, const std::string& promp
 }
 
 int main() {
-    std::vector<std::pair<std::string, std::string>> models = {
+    std::vector<std::pair<std::string, std::string>> candidate_models = {
         {"qwen3_0.6b", "./assets/qwen3_0.6b"},
+        {"qwen3_0.6b_int8", "./assets/qwen3_0.6b_int8"},
         {"minicpm4_0.5b", "./assets/minicpm4_0.5b"},
+        {"minicpm4_0.5b_int8", "./assets/minicpm4_0.5b_int8"},
         {"qwen3.5_0.8b", "./assets/qwen3.5_0.8b"},
-        {"youtu_llm", "./assets/youtu_llm"}
+        {"qwen3.5_0.8b_int8", "./assets/qwen3.5_0.8b_int8"},
+        {"youtu_llm", "./assets/youtu_llm"},
+        {"youtu_llm_int8", "./assets/youtu_llm_int8"}
     };
+    std::vector<std::pair<std::string, std::string>> models;
+    for (const auto& m : candidate_models) {
+        if (std::filesystem::exists(m.second)) {
+            models.push_back(m);
+        }
+    }
 
     std::string prompt = "你好，请用一句话介绍你自己。";
 

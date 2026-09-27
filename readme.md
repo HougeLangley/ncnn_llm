@@ -142,6 +142,37 @@ User: Hello
 Assistant: Hello! How can I help you today?
 ```
 
+## Model Quantization (INT8 Block Quantization)
+
+`ncnn_llm` supports INT8 quantization inference based on ncnn's latest Gemm block quant feature. By quantizing the Decoder weights (while keeping the LM Head / Proj Out in original precision to ensure generation quality), memory usage is significantly reduced and CPU decoding throughput is greatly improved.
+
+Taking Qwen3-0.6B as an example (Intel i9-13900HX):
+- **Size Compression**: Decoder weight reduced from 840 MB to 446 MB (~47% reduction).
+- **Speedup**: CPU decoding speed increased from 17.0 tokens/s to 32.0 tokens/s (+71.9%), Prefill latency reduced by 42%.
+- **Generation Quality**: Output is identical to the unquantized model without precision loss.
+
+### Exporting Quantized Model
+
+Quantize using ncnn's built-in tool (the script automatically locates the compiled `ncnnllm2int` tool):
+
+```bash
+# Automatically quantize a single model directory
+python export/quantize_model.py --model ./assets/qwen3_0.6b --output ./assets/qwen3_0.6b_int8 --bits 8 --block 64
+
+# Or batch quantize all models found in assets directory
+python export/quantize_model.py --all --bits 8 --block 64
+
+# Or quantize single param / bin files directly
+ncnnllm2int decoder.ncnn.param decoder.ncnn.bin decoder_int8.ncnn.param decoder_int8.ncnn.bin bits=8 block=64 method=minmax
+```
+
+### Running Quantized Model
+
+```bash
+xmake run llm_ncnn_run --model ./assets/qwen3_0.6b_int8 --threads 8
+```
+> Note: Gemm weight block quantization currently provides optimized vectorized kernels on the CPU backend (AVX2 / AVX-VNNI / ARM, etc.). The runtime will automatically execute quantized layers on CPU.
+
 ## OCR
 
 GLM-OCR uses a dedicated image prefill path and the shared text decode runtime.
@@ -288,7 +319,7 @@ ncnn_llm/
 - Keep decoder and KV-cache runtime shared across model families
 - Expand supported model architectures and tokenizers
 - Improve Vulkan and CPU performance
-- Add INT8 quantization support
+- [x] Add INT8 quantization support (Gemm Block Quantization)
 - Document model export pipelines in more detail
 
 Older export scripts may become outdated as the runtime evolves. Prefer the latest model examples and `model.json` files as references.
