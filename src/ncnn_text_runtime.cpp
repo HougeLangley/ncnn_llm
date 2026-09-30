@@ -93,18 +93,56 @@ ncnn::Mat llm_run_lm_head(ncnn::Net& lm_head_net, const ncnn::Mat& hidden_states
 }
 
 int llm_select_next_token(const ncnn::Mat& logits,
-                          const std::unordered_set<int>& history,
-                          const LlmTokenSampleConfig& cfg) {
-    const int vocab_size = cfg.vocab_size > 0 ? cfg.vocab_size : logits.w;
+                          const std::unordered_map<int, int>& history_counts,
+                          const LlmTokenSampleConfig& cfg,
+                          const std::vector<int>* generated_tokens) {
+    if (logits.empty() || logits.w <= 0 || !logits.data) {
+        return 0;
+    }
+    const int vocab_size = cfg.vocab_size > 0
+        ? std::min(cfg.vocab_size, logits.w)
+        : logits.w;
+    if (vocab_size <= 0) {
+        return 0;
+    }
     std::vector<float> scores(vocab_size);
     std::memcpy(scores.data(), logits.data, sizeof(float) * vocab_size);
 
-    for (int t : history) {
-        if (t < 0 || t >= vocab_size) continue;
+    for (const auto& kv : history_counts) {
+        int t = kv.first;
+        int count = kv.second;
+        if (t < 0 || t >= vocab_size || count <= 0) continue;
+        float penalty = (cfg.repetition_penalty > 1.0f)
+            ? std::pow(cfg.repetition_penalty, (float)std::min(count, 16))
+            : 1.0f;
         if (scores[t] < 0) {
-            scores[t] *= cfg.repetition_penalty;
+            scores[t] *= penalty;
         } else {
-            scores[t] /= cfg.repetition_penalty;
+            scores[t] /= penalty;
+        }
+    }
+
+    if (generated_tokens && !generated_tokens->empty()) {
+        const auto& gt = *generated_tokens;
+        const int n = (int)gt.size();
+        for (int L = 1; L <= 32 && n >= 2 * L; ++L) {
+            bool match = true;
+            for (int i = 0; i < L; ++i) {
+                if (gt[n - 1 - i] != gt[n - 1 - L - i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                int next_cycle_token = gt[n - L];
+                if (next_cycle_token >= 0 && next_cycle_token < vocab_size) {
+                    if (scores[next_cycle_token] < 0) {
+                        scores[next_cycle_token] *= 2.0f;
+                    } else {
+                        scores[next_cycle_token] /= 2.0f;
+                    }
+                }
+            }
         }
     }
 
@@ -123,3 +161,13 @@ int llm_select_next_token(const ncnn::Mat& logits,
 
     return sample_from_probs(scores);
 }
+
+int llm_select_next_token(const ncnn::Mat& logits,
+                          const std::unordered_set<int>& history,
+                          const LlmTokenSampleConfig& cfg) {
+    std::unordered_map<int, int> counts;
+    for (int t : history) counts[t] = 1;
+    return llm_select_next_token(logits, counts, cfg, nullptr);
+}
+
+

@@ -21,7 +21,10 @@ static std::string apply_chatml_template(
     const std::vector<Message>& messages,
     const std::vector<json>& tools,
     bool add_generation_prompt,
-    bool enable_thinking
+    bool enable_thinking,
+    bool minicpm5,
+    bool qwen35,
+    bool qwen3
 ) {
     std::stringstream prompt;
     bool has_tools = !tools.empty();
@@ -29,19 +32,61 @@ static std::string apply_chatml_template(
     // System message handling
     if (has_tools) {
         prompt << "<|im_start|>system\n";
-        if (!messages.empty() && messages[0].role == "system") {
-            prompt << messages[0].content << "\n\n";
+        if (qwen35) {
+            prompt << "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+            for (const auto& tool : tools) {
+                prompt << "\n" << tool.dump();
+            }
+            prompt << "\n</tools>\n\n"
+                   << "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+                   << "<tool_call>\n<function=example_function_name>\n"
+                   << "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+                   << "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n"
+                   << "</function>\n</tool_call>\n\n"
+                   << "<IMPORTANT>\nReminder:\n"
+                   << "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+                   << "- Required parameters MUST be specified\n"
+                   << "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+                   << "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+                   << "</IMPORTANT>";
+            if (!messages.empty() && messages[0].role == "system") {
+                std::string s_content = rstrip_newlines(lstrip_newlines(messages[0].content));
+                if (!s_content.empty()) {
+                    prompt << "\n\n" << s_content;
+                }
+            }
+        } else if (minicpm5) {
+            if (!messages.empty() && messages[0].role == "system") {
+                prompt << messages[0].content << "\n\n";
+            }
+            prompt << "# Tools\n\n"
+                   << "You are provided with function signatures within <tools></tools> XML tags:\n"
+                   << "<tools>";
+            for (const auto& tool : tools) {
+                prompt << "\n" << tool.dump();
+            }
+            prompt << "\n</tools>\n\n"
+                   << "Tool usage guidelines:\n"
+                   << "- You may call zero or more functions. If no function calls are needed, just answer normally.\n"
+                   << "- When calling a function, return an XML object using "
+                   << "<function name=\"function-name\"><param name=\"param-name\">param-value</param></function>.\n"
+                   << "- Include every required parameter and do not add text after the function call.\n";
+        } else {
+            if (!messages.empty() && messages[0].role == "system") {
+                prompt << messages[0].content << "\n\n";
+            }
+            prompt << "# Tools\n\n"
+                   << "You may call one or more functions to assist with the user query.\n\n"
+                   << "You are provided with function signatures within <tools></tools> XML tags:\n"
+                   << "<tools>";
+            for (const auto& tool : tools) {
+                prompt << "\n" << tool.dump();
+            }
+            prompt << "\n</tools>\n\n"
+                   << "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+                   << "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
         }
-        prompt << "# Tools\n\n"
-               << "You may call one or more functions to assist with the user query.\n\n"
-               << "You are provided with function signatures within <tools></tools> XML tags:\n"
-               << "<tools>";
-        for (const auto& tool : tools) {
-            prompt << "\n" << tool.dump();
-        }
-        prompt << "\n</tools>\n\n"
-               << "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
-               << "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n";
+        prompt << "<|im_end|>\n";
     } else {
         if (!messages.empty() && messages[0].role == "system") {
             prompt << "<|im_start|>system\n" << messages[0].content << "<|im_end|>\n";
@@ -114,11 +159,39 @@ static std::string apply_chatml_template(
                     if (t > 0) prompt << "\n";
                     json tc_obj = msg.tool_calls[t];
                     if (tc_obj.contains("function")) tc_obj = tc_obj["function"];
+                    std::string fn_name = tc_obj.contains("name") ? tc_obj["name"].get<std::string>() : "";
+                    json args = tc_obj.contains("arguments") ? tc_obj["arguments"] : json::object();
+                    if (args.is_string()) {
+                        auto parsed = json::parse(args.get<std::string>(), nullptr, false);
+                        if (!parsed.is_discarded()) args = parsed;
+                    }
 
-                    prompt << "<tool_call>\n"
-                           << "{\"name\": \"" << tc_obj["name"].get<std::string>() << "\", "
-                           << "\"arguments\": " << tc_obj["arguments"].dump() << "}\n"
-                           << "</tool_call>";
+                    if (minicpm5) {
+                        prompt << "<function name=\"" << fn_name << "\">";
+                        if (args.is_object()) {
+                            for (auto it = args.begin(); it != args.end(); ++it) {
+                                prompt << "<param name=\"" << it.key() << "\">"
+                                       << (it.value().is_string() ? it.value().get<std::string>() : it.value().dump())
+                                       << "</param>";
+                            }
+                        }
+                        prompt << "</function>";
+                    } else if (qwen35) {
+                        prompt << "<tool_call>\n<function=" << fn_name << ">\n";
+                        if (args.is_object()) {
+                            for (auto it = args.begin(); it != args.end(); ++it) {
+                                prompt << "<parameter=" << it.key() << ">\n"
+                                       << (it.value().is_string() ? it.value().get<std::string>() : it.value().dump())
+                                       << "\n</parameter>\n";
+                            }
+                        }
+                        prompt << "</function>\n</tool_call>";
+                    } else {
+                        prompt << "<tool_call>\n"
+                               << "{\"name\": \"" << fn_name << "\", "
+                               << "\"arguments\": " << args.dump() << "}\n"
+                               << "</tool_call>";
+                    }
                 }
             }
             prompt << "<|im_end|>\n";
@@ -132,6 +205,10 @@ static std::string apply_chatml_template(
 
     if (add_generation_prompt) {
         prompt << "<|im_start|>assistant\n";
+        if (enable_thinking) {
+            prompt << "<think>\n";
+        
+        }
     }
 
     return prompt.str();
@@ -298,7 +375,7 @@ std::string apply_chat_template(
     bool add_generation_prompt,
     bool enable_thinking
 ) {
-    return apply_chatml_template(messages, tools, add_generation_prompt, enable_thinking);
+    return apply_chatml_template(messages, tools, add_generation_prompt, enable_thinking, false, false, false);
 }
 
 std::string apply_youtu_chat_template(
@@ -319,8 +396,14 @@ std::string apply_chat_template(
     switch (type) {
         case TemplateType::YOUTU:
             return apply_youtu_template(messages, tools, add_generation_prompt);
+        case TemplateType::QWEN3:
+            return apply_chatml_template(messages, tools, add_generation_prompt, enable_thinking, false, false, true);
+        case TemplateType::MINICPM5:
+            return apply_chatml_template(messages, tools, add_generation_prompt, enable_thinking, true, false, false);
+        case TemplateType::QWEN35:
+            return apply_chatml_template(messages, tools, add_generation_prompt, enable_thinking, false, true, false);
         case TemplateType::CHATML:
         default:
-            return apply_chatml_template(messages, tools, add_generation_prompt, enable_thinking);
+            return apply_chatml_template(messages, tools, add_generation_prompt, enable_thinking, false, false, false);
     }
 }

@@ -36,6 +36,7 @@ struct GenerateConfig {
     int top_k = 50;
     float repetition_penalty = 1.1f;
     int do_sample = 1;
+    bool enable_thinking = false;
 
     std::function<nlohmann::json(const nlohmann::json&)> tool_callback = nullptr;
 
@@ -107,8 +108,14 @@ public:
             dst->kv_cache[i].first = clone_kvcache_mat(kv_cache[i].first, dst->kvcache_allocator.get());
             dst->kv_cache[i].second = clone_kvcache_mat(kv_cache[i].second, dst->kvcache_allocator.get());
         }
-        dst->sconv_cache = sconv_cache;
-        dst->gdr_cache = gdr_cache;
+        dst->sconv_cache.resize(sconv_cache.size());
+        for (size_t i = 0; i < sconv_cache.size(); ++i) {
+            dst->sconv_cache[i] = sconv_cache[i].clone();
+        }
+        dst->gdr_cache.resize(gdr_cache.size());
+        for (size_t i = 0; i < gdr_cache.size(); ++i) {
+            dst->gdr_cache[i] = gdr_cache[i].clone();
+        }
         dst->cur_token = cur_token;
         dst->position_id = position_id;
         return dst;
@@ -129,6 +136,7 @@ protected:
     std::string model_type;
     int bos = 0;
     int eos = 0;
+    std::unordered_set<int> eos_ids;
     int tool_call_id = -1;
     int tool_call_end_id = -1;
     int think_id = -1;
@@ -169,17 +177,22 @@ protected:
     } vision_rope_type;
 
     std::vector<int> mrope_section;
+    std::vector<int> vision_rope_section = {16, 16};
     std::vector<nlohmann::json> tools;
 
 public:
-    ncnn_llm_gpt(const std::string& model_path, bool use_vulkan = false, int num_threads = 0, int vulkan_device = 0, bool use_bf16 = true);
+    ncnn_llm_gpt(const std::string& model_path, bool use_vulkan = false, int num_threads = 0, int vulkan_device = 0, bool use_bf16 = true, bool force_naive = false);
 
     std::shared_ptr<ncnn_llm_gpt_ctx> prefill(const std::string& input_text) const;
     std::shared_ptr<ncnn_llm_gpt_ctx> prefill(const std::string& input_text, const ncnn::Mat& bgr, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const;
     std::shared_ptr<ncnn_llm_gpt_ctx> prefill(const std::string& input_text, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const;
     std::shared_ptr<ncnn_llm_gpt_ctx> generate(const std::shared_ptr<ncnn_llm_gpt_ctx>& ctx_in, const GenerateConfig& cfg, std::function<void(const std::string&)> callback) const;
 
-    std::shared_ptr<ncnn_llm_gpt_ctx> define_tools(const std::shared_ptr<ncnn_llm_gpt_ctx>& ctx, const std::vector<nlohmann::json>& tools, const std::string& system_prompt = "You are a helpful assistant.");
+    std::shared_ptr<ncnn_llm_gpt_ctx> define_tools(const std::shared_ptr<ncnn_llm_gpt_ctx>& ctx, const std::vector<nlohmann::json>& tools, const std::string& system_prompt = "You are a helpful assistant.", TemplateType template_type = TemplateType::CHATML);
+
+    bool supports_tool_calling() const { return tool_call_id >= 0; }
+    bool supports_vision() const { return vision_type != Vision_Type::VISION_CLOSE; }
+    const std::string& get_model_type() const { return model_type; }
 
     template<typename T>
     static constexpr const char* json_type_name() {

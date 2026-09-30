@@ -21,3 +21,5 @@ __pycache__/
 /build_cmake/
 /dist/
 /.xmake/
+/build*
+/models/

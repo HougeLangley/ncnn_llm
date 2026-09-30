@@ -50,9 +50,11 @@ The project started from **nihui's** experimental ncnn `kvcache` work and expand
 | --- | --- | --- | --- |
 | LLM | YoutuLLM | Supported | Chat / text generation |
 | LLM | MiniCPM4 | Supported | Chat / text generation |
+| LLM | MiniCPM5 | Supported | Chat, reasoning, and XML tool calls |
 | LLM | Qwen3 | Supported | Chat / text generation |
-| VLM | Qwen3.5 | Supported | Image + text input |
+| LLM | Qwen3.5 | Supported | Hybrid attention with GatedDeltaRule and ShortConv |
 | VLM | Qwen2.5-VL | Supported | Image + text input |
+| VLM | Qwen3.5-VL | Supported | Image + text input with mRoPE |
 | OCR | GLM-OCR | Supported | OCR |
 | OCR | HunyuanOCR | Supported | OCR |
 | ASR | Qwen3 ASR | Supported | ASR |
@@ -86,7 +88,7 @@ git submodule update --init --recursive
 ### 3. Build
 
 ```bash
-# Configure (use -DNCNN_LLM_ENABLE_VULKAN=ON/OFF to toggle Vulkan)
+# Configure project (options: -DNCNN_LLM_ENABLE_VULKAN=ON/OFF, -DNCNN_LLM_ENABLE_TOOLS=ON/OFF)
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DNCNN_LLM_ENABLE_VULKAN=ON
 
 # Build
@@ -144,12 +146,14 @@ Vision-language input:
 
 | Option | Description |
 | --- | --- |
-| `--model` | Model directory |
-| `--threads` | CPU thread count |
-| `--vulkan` | Enable Vulkan compute |
-| `--vulkan-device` | Vulkan device index |
-| `--image` | Image path for VL models |
-| `--builtin-tools` | Enable built-in demo tools |
+| `--model <path>` | Model directory (default: `./assets/qwen3_0.6b`) |
+| `--threads <num>` | Number of CPU threads (default: auto) |
+| `--use-vulkan` | Enable Vulkan GPU compute (`--vulkan` also accepted) |
+| `--vulkan-device <index>` | Vulkan device index (default: `0`) |
+| `--image <path>` | Input image path for vision-language (VL) models |
+| `--max-new-tokens <num>` | Maximum generated tokens (default: `512`) |
+| `--enable-thinking` | Enable model reasoning output (`<think>...</think>`) |
+| `--no-builtin-tools` | Disable built-in demo tools (calculator/random) |
 
 Example session:
 
@@ -304,8 +308,8 @@ if (embed.supports_image()) {
 | `embedding_main` | Text embedding inference |
 | `clip_main` | CLIP text-image embedding inference |
 | `laya_main` | Laya / Laya-Multilingual discriminator inference |
-| `unigram_main` | Unigram tokenizer example |
-| `benchllm` | LLM benchmark |
+| `benchllm` | LLM benchmark (exact prefill tokens/s & decode ms/tok) |
+| `bench_qwen35` | Qwen3.5 linear attention (GDR & ShortConv) benchmark |
 | `test_llm` | Unit tests |
 | `test_bf16` | BF16 tests |
 | `test_kernel` | GDR and ShortConv kernel memory pool & SIMD unit tests |
@@ -320,7 +324,7 @@ Run benchmark:
 
 ```bash
 cmake --build build --config Release --target benchllm
-./build/benchllm [loop_count] [num_threads] [powersave] [gpu_device] [cooling_down] [seqlen]
+./build/benchllm [loop_count] [threads] [powersave] [gpu_device] [cooling_down] [pp] [tg]
 ```
 
 ## Model Zoo

@@ -50,9 +50,11 @@
 | --- | --- | --- | --- |
 | LLM | YoutuLLM | 已支持 | 聊天 / 文本生成 |
 | LLM | MiniCPM4 | 已支持 | 聊天 / 文本生成 |
+| LLM | MiniCPM5 | 已支持 | 聊天、思考与 XML 工具调用 |
 | LLM | Qwen3 | 已支持 | 聊天 / 文本生成 |
-| VLM | Qwen3.5 | 已支持 | 图像 + 文本输入 |
+| LLM | Qwen3.5 | 已支持 | GatedDeltaRule 与 ShortConv 混合注意力 |
 | VLM | Qwen2.5-VL | 已支持 | 图像 + 文本输入 |
+| VLM | Qwen3.5-VL | 已支持 | 图像 + 文本输入与 mRoPE |
 | OCR | GLM-OCR | 已支持 | OCR |
 | OCR | HunyuanOCR | 已支持 | OCR |
 | ASR | Qwen3 ASR | 已支持 | ASR |
@@ -86,7 +88,7 @@ git submodule update --init --recursive
 ### 3. 构建
 
 ```bash
-# 配置工程（可通过 -DNCNN_LLM_ENABLE_VULKAN=ON/OFF 控制 Vulkan 支持）
+# 配置工程（可选选项：-DNCNN_LLM_ENABLE_VULKAN=ON/OFF、-DNCNN_LLM_ENABLE_TOOLS=ON/OFF 构建 ncnn 工具）
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DNCNN_LLM_ENABLE_VULKAN=ON
 
 # 编译
@@ -144,12 +146,14 @@ assets/
 
 | 选项 | 说明 |
 | --- | --- |
-| `--model` | 模型目录 |
-| `--threads` | CPU 线程数 |
-| `--vulkan` | 启用 Vulkan 计算 |
-| `--vulkan-device` | Vulkan 设备编号 |
-| `--image` | VLM 输入图像路径 |
-| `--builtin-tools` | 启用内置演示工具 |
+| `--model <path>` | 模型目录（默认: `./assets/qwen3_0.6b`） |
+| `--threads <num>` | CPU 线程数（默认: auto） |
+| `--use-vulkan` | 启用 Vulkan GPU 计算（同时支持 `--vulkan`） |
+| `--vulkan-device <index>` | Vulkan 设备编号（默认: `0`） |
+| `--image <path>` | VLM 视觉语言模型输入图像路径 |
+| `--max-new-tokens <num>` | 最大生成 token 数量（默认: `512`） |
+| `--enable-thinking` | 开启模型推理思考过程（输出 `<think>...</think>`） |
+| `--no-builtin-tools` | 禁用内置演示工具（计算器/随机数） |
 
 示例会话：
 
@@ -305,8 +309,8 @@ if (embed.supports_image()) {
 | `embedding_main` | 文本嵌入推理 |
 | `clip_main` | CLIP 图文嵌入推理 |
 | `laya_main` | Laya / Laya-Multilingual 判别器推理 |
-| `unigram_main` | Unigram 分词器示例 |
-| `benchllm` | LLM 性能测试 |
+| `benchllm` | LLM 端到端精确 Prefill & Decode 性能测试 |
+| `bench_qwen35` | Qwen3.5 线性注意力（GDR 与 ShortConv）性能测试 |
 | `test_llm` | 单元测试 |
 | `test_bf16` | BF16 精度测试 |
 | `test_kernel` | GDR 与 ShortConv 算子内存池及 SIMD 优化单元测试 |
@@ -321,7 +325,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 ```bash
 cmake --build build --config Release --target benchllm
-./build/benchllm [loop_count] [num_threads] [powersave] [gpu_device] [cooling_down] [seqlen]
+./build/benchllm [loop_count] [threads] [powersave] [gpu_device] [cooling_down] [pp] [tg]
 ```
 
 ## 模型库

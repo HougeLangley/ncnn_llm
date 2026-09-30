@@ -2,7 +2,91 @@
 #include "ncnn_text_runtime.h"
 #include "utils/vision_rope.h"
 
+
+static nlohmann::json parse_tool_call_payload(const std::string& payload) {
+    try {
+        const std::string trimmed = payload;
+        auto parsed = nlohmann::json::parse(trimmed, nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object()) return parsed;
+
+        const size_t fn = payload.find("<function=");
+        if (fn == std::string::npos) {
+            // MiniCPM5 emits <function name=...><param name=...>...</param>.
+            const size_t name_tag = payload.find("name=\"");
+            if (name_tag == std::string::npos) return nlohmann::json::object();
+            const size_t name_begin = name_tag + 6;
+            const size_t name_end = payload.find('"', name_begin);
+            if (name_end == std::string::npos) return nlohmann::json::object();
+
+            nlohmann::json args = nlohmann::json::object();
+            size_t cursor = payload.find('>', name_end);
+            if (cursor == std::string::npos) return nlohmann::json::object();
+            ++cursor;
+            while (true) {
+                const size_t tag = payload.find("<param", cursor);
+                if (tag == std::string::npos) break;
+                const size_t key_tag = payload.find("name=\"", tag);
+                if (key_tag == std::string::npos) break;
+                const size_t key_begin = key_tag + 6;
+                const size_t key_end = payload.find('"', key_begin);
+                if (key_end == std::string::npos) break;
+                const size_t value_begin = payload.find('>', key_end);
+                if (value_begin == std::string::npos) break;
+                const size_t value_end = payload.find("</param>", value_begin + 1);
+                if (value_end == std::string::npos) break;
+
+                std::string value = payload.substr(value_begin + 1, value_end - value_begin - 1);
+                const size_t first = value.find_first_not_of(" \t\r\n");
+                const size_t last = value.find_last_not_of(" \t\r\n");
+                value = first == std::string::npos ? std::string() : value.substr(first, last - first + 1);
+                if (value.rfind("<![CDATA[", 0) == 0 && value.size() >= 12 &&
+                    value.compare(value.size() - 3, 3, "]]>") == 0) {
+                    value = value.substr(9, value.size() - 12);
+                }
+                auto value_json = nlohmann::json::parse(value, nullptr, false);
+                args[payload.substr(key_begin, key_end - key_begin)] =
+                    value_json.is_discarded() ? nlohmann::json(value) : value_json;
+                cursor = value_end + 8;
+            }
+
+            return nlohmann::json{{"name", payload.substr(name_begin, name_end - name_begin)},
+                                  {"arguments", std::move(args)}};
+        }
+        const size_t name_begin = fn + 10;
+        const size_t name_end = payload.find('>', name_begin);
+        if (name_end == std::string::npos) return nlohmann::json::object();
+
+        nlohmann::json args = nlohmann::json::object();
+        size_t cursor = name_end + 1;
+        while (true) {
+            const size_t tag = payload.find("<parameter=", cursor);
+            if (tag == std::string::npos) break;
+            const size_t key_begin = tag + 11;
+            const size_t key_end = payload.find('>', key_begin);
+            if (key_end == std::string::npos) break;
+            const size_t value_end = payload.find("</parameter>", key_end + 1);
+            if (value_end == std::string::npos) break;
+            std::string value = payload.substr(key_end + 1, value_end - key_end - 1);
+            const size_t first = value.find_first_not_of(" \t\r\n");
+            const size_t last = value.find_last_not_of(" \t\r\n");
+            value = first == std::string::npos ? std::string() : value.substr(first, last - first + 1);
+            auto value_json = nlohmann::json::parse(value, nullptr, false);
+            args[payload.substr(key_begin, key_end - key_begin)] =
+                value_json.is_discarded() ? nlohmann::json(value) : value_json;
+            cursor = value_end + 12;
+        }
+
+        return nlohmann::json{{"name", payload.substr(name_begin, name_end - name_begin)},
+                              {"arguments", std::move(args)}};
+    } catch (...) {
+        return nlohmann::json::object();
+    }
+}
+
 static std::shared_ptr<ncnn_llm_gpt_ctx> clone_ctx(const std::shared_ptr<ncnn_llm_gpt_ctx>& src) {
+    if (!src) {
+        throw std::runtime_error("LLM context must not be null");
+    }
     return src->clone();
 }
 
@@ -18,9 +102,25 @@ static std::shared_ptr<ncnn_llm_gpt_ctx> create_ctx(int sconv_cnt, int gdr_cnt) 
     return ctx;
 }
 
+static void require_extract(int ret, const ncnn::Mat& output, const std::string& name) {
+    if (ret != 0 || output.empty()) {
+        throw std::runtime_error("ncnn extract failed for " + name + " (ret=" +
+                                 std::to_string(ret) + ")");
+    }
+}
+
+static int take_last_token(std::vector<int>& token_ids) {
+    if (token_ids.empty()) {
+        throw std::runtime_error("input text produced no tokens");
+    }
+    const int last_token_id = token_ids.back();
+    token_ids.pop_back();
+    return last_token_id;
+}
+
 // Class Implementation
 
-ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int num_threads, int vulkan_device, bool use_bf16) 
+ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int num_threads, int vulkan_device, bool use_bf16, bool force_naive)
     : vision_type(Vision_Type::VISION_CLOSE) {
     try {
         json config;
@@ -80,9 +180,27 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
         printf("  proj_out param: %s\n", proj_out_param.c_str());
         printf("  proj_out bin: %s\n", proj_out_bin.c_str());
 
-        register_gdr_layers(*decoder_net);
+        auto load_net = [](ncnn::Net& net, const std::string& name,
+                           const std::string& param_path, const std::string& bin_path) {
+            const int param_ret = net.load_param(param_path.c_str());
+            if (param_ret != 0) {
+                throw std::runtime_error(name + " load_param failed (ret=" +
+                                         std::to_string(param_ret) + "): " + param_path);
+            }
+            const int model_ret = net.load_model(bin_path.c_str());
+            if (model_ret != 0) {
+                throw std::runtime_error(name + " load_model failed (ret=" +
+                                         std::to_string(model_ret) + "): " + bin_path);
+            }
+        };
 
-        decoder_net->load_param(decoder_param.c_str());
+        register_gdr_layers(*decoder_net, force_naive);
+
+        const int decoder_param_ret = decoder_net->load_param(decoder_param.c_str());
+        if (decoder_param_ret != 0) {
+            throw std::runtime_error("decoder load_param failed (ret=" +
+                                     std::to_string(decoder_param_ret) + "): " + decoder_param);
+        }
         if (use_vulkan) {
             for (const auto* layer : decoder_net->layers()) {
                 if (layer && !layer->support_vulkan) {
@@ -92,11 +210,13 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
                 }
             }
         }
-        decoder_net->load_model(decoder_bin.c_str());
-        embed_net->load_param(embed_param.c_str());
-        embed_net->load_model(embed_bin.c_str());
-        proj_out_net->load_param(proj_out_param.c_str());
-        proj_out_net->load_model(proj_out_bin.c_str());
+        const int decoder_model_ret = decoder_net->load_model(decoder_bin.c_str());
+        if (decoder_model_ret != 0) {
+            throw std::runtime_error("decoder load_model failed (ret=" +
+                                     std::to_string(decoder_model_ret) + "): " + decoder_bin);
+        }
+        load_net(*embed_net, "embed", embed_param, embed_bin);
+        load_net(*proj_out_net, "proj_out", proj_out_param, proj_out_bin);
 
         // Load tokenizer
         std::string type = "bpe";
@@ -117,6 +237,13 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
 
         auto eos_token = config["tokenizer"]["eos"].get<std::string>();
         eos = (eos_token != "") ? bpe->token_to_id().at(eos_token) : -1;
+        eos_ids.clear();
+        if (eos >= 0) eos_ids.insert(eos);
+        if (config["tokenizer"].contains("eos_ids")) {
+            for (const auto& value : config["tokenizer"]["eos_ids"]) {
+                eos_ids.insert(value.get<int>());
+            }
+        }
 
         auto bos_token = config["tokenizer"]["bos"].get<std::string>();
         bos = (bos_token != "") ? bpe->token_to_id().at(bos_token) : -1;
@@ -220,10 +347,8 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
                     vision_embed_patch->opt.use_vulkan_compute = true;
                     vision_encoder->opt.use_vulkan_compute = true;
                 }
-                vision_embed_patch->load_param(vision_embed_patch_param.c_str());
-                vision_embed_patch->load_model(vision_embed_patch_bin.c_str());
-                vision_encoder->load_param(vision_encoder_param.c_str());
-                vision_encoder->load_model(vision_encoder_bin.c_str());
+                load_net(*vision_embed_patch, "vision_embed_patch", vision_embed_patch_param, vision_embed_patch_bin);
+                load_net(*vision_encoder, "vision_encoder", vision_encoder_param, vision_encoder_bin);
 
                 if (vision_cfg.contains("vision_embed_pos_param")) {
                     std::string vision_embed_pos_param = model_path + "/" + vision_cfg["vision_embed_pos_param"].get<std::string>();
@@ -235,8 +360,7 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
                     if (use_vulkan) {
                         vision_embed_pos->opt.use_vulkan_compute = true;
                     }
-                    vision_embed_pos->load_param(vision_embed_pos_param.c_str());
-                    vision_embed_pos->load_model(vision_embed_pos_bin.c_str());
+                    load_net(*vision_embed_pos, "vision_embed_pos", vision_embed_pos_param, vision_embed_pos_bin);
                 }
 
                 auto it = bpe->token_to_id().find("<|image_pad|>");
@@ -257,6 +381,16 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
                         mrope_section = rope_cfg["mrope_section"].get<std::vector<int>>();
                     }
                 }
+
+                if (vision_cfg.contains("rope_section")) {
+                    vision_rope_section = vision_cfg["rope_section"].get<std::vector<int>>();
+                } else if (vision_cfg.contains("head_dim")) {
+                    int hd = vision_cfg["head_dim"].get<int>();
+                    vision_rope_section = {hd / 4, hd / 4};
+                } else {
+                    int hd = (patch_dim == 1152) ? 72 : 64;
+                    vision_rope_section = {hd / 4, hd / 4};
+                }
             }
         }
     } catch (std::exception &e) {
@@ -268,8 +402,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     auto token_ids = bpe->encode(input_text, false, false);
     if (bos >= 0) token_ids.insert(token_ids.begin(), bos);
 
-    int last_token_id = token_ids.back();
-    token_ids.pop_back();
+    const int last_token_id = take_last_token(token_ids);
 
     ncnn::Mat cos_cache, sin_cache;
     if (rope_type == RoPE_Type::LongRoPE) {
@@ -289,7 +422,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     {
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", input_ids_mat);
-        ex.extract("out0", token_embed);
+        require_extract(ex.extract("out0", token_embed), token_embed, "embed/out0");
     }
 
     ncnn::Mat mask((int)token_ids.size(), (int)token_ids.size());
@@ -325,8 +458,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(name_k_out, sizeof(name_k_out), "out_cache_k%d", i);
             std::snprintf(name_v_out, sizeof(name_v_out), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(name_k_out, k_cache, 1);
-            ex.extract(name_v_out, v_cache, 1);
+            const int k_ret = ex.extract(name_k_out, k_cache, 1);
+            const int v_ret = ex.extract(name_v_out, v_cache, 1);
+            require_extract(k_ret, k_cache, name_k_out);
+            require_extract(v_ret, v_cache, name_v_out);
             kv_cache.emplace_back(std::move(k_cache), std::move(v_cache));
         }
 
@@ -334,7 +469,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             char name_out[32];
             std::snprintf(name_out, sizeof(name_out), "out_cache_conv%d", i);
             ncnn::Mat cache;
-            ex.extract(name_out, cache);
+            const int ret = ex.extract(name_out, cache);
+            require_extract(ret, cache, name_out);
             sconv_cache.emplace_back(std::move(cache));
         }
 
@@ -342,7 +478,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             char name_out[32];
             std::snprintf(name_out, sizeof(name_out), "out_cache_gdr%d", i);
             ncnn::Mat cache;
-            ex.extract(name_out, cache);
+            const int ret = ex.extract(name_out, cache);
+            require_extract(ret, cache, name_out);
             gdr_cache.emplace_back(std::move(cache));
         }
     }
@@ -353,7 +490,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     {
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", last_token_mat);
-        ex.extract("out0", last_token_embed);
+        require_extract(ex.extract("out0", last_token_embed), last_token_embed, "embed/out0");
     }
     
     ncnn::Mat last_cos_cache, last_sin_cache;
@@ -409,8 +546,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(name_k_out, sizeof(name_k_out), "out_cache_k%d", i);
             std::snprintf(name_v_out, sizeof(name_v_out), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(name_k_out, k_cache, 1);
-            ex.extract(name_v_out, v_cache, 1);
+            const int k_ret = ex.extract(name_k_out, k_cache, 1);
+            const int v_ret = ex.extract(name_v_out, v_cache, 1);
+            require_extract(k_ret, k_cache, name_k_out);
+            require_extract(v_ret, v_cache, name_v_out);
             kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -418,7 +557,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             char name_out[32];
             std::snprintf(name_out, sizeof(name_out), "out_cache_conv%d", i);
             ncnn::Mat cache;
-            ex.extract(name_out, cache);
+            const int ret = ex.extract(name_out, cache);
+            require_extract(ret, cache, name_out);
             sconv_cache[i] = std::move(cache);
         }
 
@@ -426,18 +566,19 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             char name_out[32];
             std::snprintf(name_out, sizeof(name_out), "out_cache_gdr%d", i);
             ncnn::Mat cache;
-            ex.extract(name_out, cache);
+            const int ret = ex.extract(name_out, cache);
+            require_extract(ret, cache, name_out);
             gdr_cache[i] = std::move(cache);
         }
 
-        ex.extract("out0", decode_out);
+        require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
     }
 
     ncnn::Mat logits;
     {
         ncnn::Extractor ex = proj_out_net->create_extractor();
         ex.input("in0", decode_out);
-        ex.extract("out0", logits);
+        require_extract(ex.extract("out0", logits), logits, "proj_out/out0");
     }
 
     int next_token_id = 0;
@@ -468,6 +609,13 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
 }
 
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input_text, const ncnn::Mat& bgr, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const {
+    if (ncnn_mat_empty(bgr)) {
+        throw std::runtime_error("image input is empty");
+    }
+    if (vision_type == Vision_Type::VISION_CLOSE || !vision_embed_patch || !vision_encoder) {
+        throw std::runtime_error("model does not support image input");
+    }
+
     std::shared_ptr<ncnn_llm_gpt_ctx> new_ctx = clone_ctx(ctx);
     ncnn::Allocator* kv_alloc = new_ctx->kvcache_allocator ? new_ctx->kvcache_allocator.get() : nullptr;
     const int max_seqlen_hint = new_ctx->position_id + (int)input_text.size() + 512;
@@ -475,24 +623,28 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     ncnn::Mat image_embeds;
     int num_patches_w = 0;
     int num_patches_h = 0;
-    get_visiual_features(bgr, image_embeds, num_patches_w, num_patches_h);
-
+    const int vision_ret = get_visiual_features(bgr, image_embeds, num_patches_w, num_patches_h);
+    if (vision_ret != 0 || image_embeds.empty()) {
+        throw std::runtime_error("vision feature extraction failed");
+    }
     const int image_embeds_size = image_embeds.h;
 
     auto token_ids = bpe->encode(input_text, false, false);
-    int last_token_id = token_ids.back();
-    token_ids.pop_back();
+    const int last_token_id = take_last_token(token_ids);
 
     ncnn::Mat input_ids_mat = ncnn::Mat((int)token_ids.size(), 1, (void*)token_ids.data()).clone();
     ncnn::Mat token_embed;
     {
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", input_ids_mat);
-        ex.extract("out0", token_embed);
+        require_extract(ex.extract("out0", token_embed), token_embed, "embed/out0");
     }
 
     int image_pad_index = -1;
     inject_image_embeds(token_ids, token_embed, image_pad_index, image_pad_id, image_embeds);
+    if (image_pad_index < 0) {
+        throw std::runtime_error("image placeholder token was not found in the prompt");
+    }
 
     ncnn::Mat cos_cache, sin_cache;
     if (image_embeds.empty()) {
@@ -500,11 +652,12 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         new_ctx->position_id += token_ids.size();
     } else {
         if (vision_type == Vision_Type::VISION_QWEN3_5_VL) {
-            generate_rope_embed_cache_vision_mrope_interleaved(token_ids.size(), rope_head_dim, new_ctx->position_id, image_pad_index, image_embeds_size, num_patches_w, cos_cache, sin_cache, rope_theta);
+            generate_rope_embed_cache_vision_mrope_interleaved(token_ids.size(), rope_head_dim, new_ctx->position_id, image_pad_index, image_embeds_size, num_patches_w, num_patches_h, cos_cache, sin_cache, rope_theta);
         } else {
             generate_rope_embed_cache_vision_mrope(token_ids.size(), rope_head_dim, new_ctx->position_id, image_pad_index, image_embeds_size, num_patches_w, spatial_merge_size, mrope_section, cos_cache, sin_cache, rope_theta);
         }
-        new_ctx->position_id += token_ids.size() - image_embeds_size + (num_patches_w / spatial_merge_size);
+        new_ctx->position_id += token_ids.size() - image_embeds_size +
+                                (std::max(num_patches_w, num_patches_h) / spatial_merge_size);
     }
 
     ncnn::Mat mask((int)token_ids.size() + new_ctx->kv_cache[0].first.h, (int)token_ids.size());
@@ -557,8 +710,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
             std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(kname, k_cache, 1);
-            ex.extract(vname, v_cache, 1);
+            require_extract(ex.extract(kname, k_cache, 1), k_cache, kname);
+            require_extract(ex.extract(vname, v_cache, 1), v_cache, vname);
             new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -567,14 +720,14 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_conv%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->sconv_cache[i] = std::move(cache);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_gdr%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->gdr_cache[i] = std::move(cache);
             }
         }
@@ -585,7 +738,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     {
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", last_token_mat);
-        ex.extract("out0", last_token_embed);
+        require_extract(ex.extract("out0", last_token_embed), last_token_embed, "embed/out0");
     }
     
     ncnn::Mat last_cos_cache, last_sin_cache;
@@ -635,8 +788,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
             std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(kname, k_cache, 1);
-            ex.extract(vname, v_cache, 1);
+            require_extract(ex.extract(kname, k_cache, 1), k_cache, kname);
+            require_extract(ex.extract(vname, v_cache, 1), v_cache, vname);
             new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -645,26 +798,26 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_conv%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->sconv_cache[i] = std::move(cache);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_gdr%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->gdr_cache[i] = std::move(cache);
             }
         }
 
-        ex.extract("out0", decode_out);
+        require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
     }
 
     ncnn::Mat logits;
     {
         ncnn::Extractor ex = proj_out_net->create_extractor();
         ex.input("in0", decode_out);
-        ex.extract("out0", logits);
+        require_extract(ex.extract("out0", logits), logits, "proj_out/out0");
     }
     
     int next_token_id = 0;
@@ -688,8 +841,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     const int max_seqlen_hint = new_ctx->position_id + (int)input_text.size() + 512;
 
     auto token_ids = bpe->encode(input_text, false, false);
-    int last_token_id = token_ids.back();
-    token_ids.pop_back();
+    const int last_token_id = take_last_token(token_ids);
 
     ncnn::Mat cos_cache, sin_cache;
     int current_pos = new_ctx->position_id;
@@ -711,7 +863,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     {
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", input_ids_mat);
-        ex.extract("out0", token_embed);
+        require_extract(ex.extract("out0", token_embed), token_embed, "embed/out0");
     }
 
     ncnn::Mat mask((int)token_ids.size() + new_ctx->kv_cache[0].first.h, (int)token_ids.size());
@@ -764,8 +916,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
             std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(kname, k_cache, 1);
-            ex.extract(vname, v_cache, 1);
+            require_extract(ex.extract(kname, k_cache, 1), k_cache, kname);
+            require_extract(ex.extract(vname, v_cache, 1), v_cache, vname);
             new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -774,14 +926,14 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_conv%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->sconv_cache[i] = std::move(cache);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_gdr%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->gdr_cache[i] = std::move(cache);
             }
         }
@@ -792,7 +944,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     {
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", last_token_mat);
-        ex.extract("out0", last_token_embed);
+        require_extract(ex.extract("out0", last_token_embed), last_token_embed, "embed/out0");
     }
     
     ncnn::Mat last_cos_cache, last_sin_cache;
@@ -852,8 +1004,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
             std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
             ncnn::Mat k_cache, v_cache;
-            ex.extract(kname, k_cache, 1);
-            ex.extract(vname, v_cache, 1);
+            require_extract(ex.extract(kname, k_cache, 1), k_cache, kname);
+            require_extract(ex.extract(vname, v_cache, 1), v_cache, vname);
             new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
         }
 
@@ -862,26 +1014,26 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_conv%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->sconv_cache[i] = std::move(cache);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_gdr%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->gdr_cache[i] = std::move(cache);
             }
         }
 
-        ex.extract("out0", decode_out);
+        require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
     }
 
     ncnn::Mat logits;
     {
         ncnn::Extractor ex = proj_out_net->create_extractor();
         ex.input("in0", decode_out);
-        ex.extract("out0", logits);
+        require_extract(ex.extract("out0", logits), logits, "proj_out/out0");
     }
     
     int next_token_id = 0;
@@ -904,12 +1056,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
     const int vocab_size = bpe->vocab_size();
 
     auto handle_tool = [&](const std::string& tool_call_text, std::shared_ptr<ncnn_llm_gpt_ctx>& ctx_ref) {
-        nlohmann::json tool_call_json;
-        try {
-            tool_call_json = nlohmann::json::parse(tool_call_text);
-        } catch (const std::exception& e) {
-            tool_call_json = nlohmann::json::object();
-        }
+        nlohmann::json tool_call_json = parse_tool_call_payload(tool_call_text);
 
         nlohmann::json tool_resp;
         if (cfg.tool_callback) {
@@ -919,34 +1066,52 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
         }
 
         std::string tool_response_pre = "<|im_end|>\n<|im_start|>user\n<tool_response>\n\n";
-        std::string tool_response_post = "\n\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n";
+        std::string tool_response_post = cfg.enable_thinking
+            ? "\n\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+            : "\n\n</tool_response><|im_end|>\n<|im_start|>assistant\n";
 
         ctx_ref = prefill(tool_response_pre + tool_resp.dump() + tool_response_post, ctx_ref);
     };
 
     auto ctx = clone_ctx(ctx_in);
-    std::unordered_set<int> history;
-    history.insert(ctx->cur_token);
+    std::unordered_map<int, int> history_counts;
+    history_counts[ctx->cur_token]++;
+    std::vector<int> generated_tokens;
+    generated_tokens.push_back(ctx->cur_token);
 
     bool flag_in_tool_call = false;
+    bool flag_in_thinking = false;
     std::string tool_call_content;
 
     for (int step = 0; step < cfg.max_new_tokens; ++step) {
-        if (ctx->cur_token == eos) break;
+        if (eos_ids.count(ctx->cur_token)) break;
 
         if (ctx->cur_token == tool_call_id) {
             flag_in_tool_call = true;
+            flag_in_thinking = false;
         } else if (ctx->cur_token == tool_call_end_id) {
             flag_in_tool_call = false;
+            flag_in_thinking = false;
             handle_tool(tool_call_content, ctx);
             tool_call_content.clear();
-            history.clear();
-            history.insert(ctx->cur_token);
+            history_counts.clear();
+            history_counts[ctx->cur_token]++;
+            generated_tokens.clear();
+            generated_tokens.push_back(ctx->cur_token);
             continue;
         } else if (flag_in_tool_call) {
             tool_call_content += bpe->decode({ctx->cur_token}, false);
         } else {
-            callback(bpe->decode({ctx->cur_token}, false));
+            if (ctx->cur_token == think_id) {
+                flag_in_thinking = true;
+            } else if (ctx->cur_token == think_end_id) {
+                flag_in_thinking = false;
+            }
+            if (callback && (cfg.enable_thinking ||
+                             (!flag_in_thinking && ctx->cur_token != think_id &&
+                              ctx->cur_token != think_end_id))) {
+                callback(bpe->decode({ctx->cur_token}, false));
+            }
         }
 
         ncnn::Mat cur_embed = llm_run_text_embed(*embed_net, ctx->cur_token);
@@ -1012,8 +1177,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
                 std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
                 std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
                 ncnn::Mat k_cache, v_cache;
-                ex.extract(kname, k_cache, 1);
-                ex.extract(vname, v_cache, 1);
+                require_extract(ex.extract(kname, k_cache, 1), k_cache, kname);
+                require_extract(ex.extract(vname, v_cache, 1), v_cache, vname);
                 ctx->kv_cache[i] = { std::move(k_cache), std::move(v_cache) };
             }
 
@@ -1021,18 +1186,18 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_conv%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->sconv_cache[i] = std::move(cache);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
                 char name[32];
                 std::snprintf(name, sizeof(name), "out_cache_gdr%d", i);
                 ncnn::Mat cache;
-                ex.extract(name, cache);
+                require_extract(ex.extract(name, cache), cache, name);
                 qwen_ctx->gdr_cache[i] = std::move(cache);
             }
 
-            ex.extract("out0", decode_out);
+            require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
         }
 
         ncnn::Mat logits_mat = llm_run_lm_head(*proj_out_net, decode_out);
@@ -1044,19 +1209,19 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
         sample_cfg.top_k = cfg.top_k;
         sample_cfg.repetition_penalty = cfg.repetition_penalty;
         sample_cfg.do_sample = cfg.do_sample;
-        int next_id = llm_select_next_token(logits_mat, history, sample_cfg);
+        int next_id = llm_select_next_token(logits_mat, history_counts, sample_cfg, &generated_tokens);
 
         ctx->cur_token = next_id;
-        history.insert(next_id);
+        history_counts[next_id]++;
+        generated_tokens.push_back(next_id);
     }
     return ctx;
 }
 
-std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::define_tools(const std::shared_ptr<ncnn_llm_gpt_ctx>& ctx, const std::vector<nlohmann::json>& tools, const std::string& system_prompt) {
-    if (tool_call_id < 0 || tool_call_end_id < 0) return ctx;
+std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::define_tools(const std::shared_ptr<ncnn_llm_gpt_ctx>& ctx, const std::vector<nlohmann::json>& tools, const std::string& system_prompt, TemplateType template_type) {
 
     this->tools = tools;
-    std::string tool_prompt = apply_chat_template({{"system", system_prompt}}, tools, false, false);
+    std::string tool_prompt = apply_chat_template(template_type, {{"system", system_prompt}}, tools, false, false);
 
     if (ctx) return prefill(tool_prompt, ctx);
     return prefill(tool_prompt);
@@ -1129,9 +1294,9 @@ ncnn::Mat ncnn_llm_gpt::bgr_to_pixel_values(const ncnn::Mat& bgr) const {
                 if (img_row_ptr && cur_img_x < img_w) {
                     const unsigned char* pixel = img_row_ptr + cur_img_x * 3;
                     if (vision_type == Vision_Type::VISION_QWEN3_5_VL) {
-                        *ptr_r++ = (pixel[2] / 255.5f - image_mean[0]) / image_std[0];
-                        *ptr_g++ = (pixel[1] / 255.5f - image_mean[1]) / image_std[1];
-                        *ptr_b++ = (pixel[0] / 255.5f - image_mean[2]) / image_std[2];
+                        *ptr_r++ = (pixel[2] / 255.0f - image_mean[0]) / image_std[0];
+                        *ptr_g++ = (pixel[1] / 255.0f - image_mean[1]) / image_std[1];
+                        *ptr_b++ = (pixel[0] / 255.0f - image_mean[2]) / image_std[2];
                     } else {
                         *ptr_r++ = (pixel[2] / 255.f - image_mean[0]) / image_std[0];
                         *ptr_g++ = (pixel[1] / 255.f - image_mean[1]) / image_std[1];
@@ -1269,7 +1434,7 @@ int ncnn_llm_gpt::get_visiual_features(const ncnn::Mat& bgr, ncnn::Mat& image_em
         ncnn::Mat patch_embed;
         ncnn::Extractor ex = vision_embed_patch->create_extractor();
         ex.input("in0", patch);
-        ex.extract("out0", patch_embed);
+        require_extract(ex.extract("out0", patch_embed), patch_embed, "vision_embed_patch/out0");
         memcpy(patch_embeds.row(i), patch_embed.reshape(patch_dim), patch_dim * sizeof(float));
     }
 
@@ -1279,14 +1444,14 @@ int ncnn_llm_gpt::get_visiual_features(const ncnn::Mat& bgr, ncnn::Mat& image_em
             ncnn::Mat grid(num_patches_w, num_patches_h);
             ncnn::Extractor ex = vision_embed_pos->create_extractor();
             ex.input("in0", grid);
-            ex.extract("out0", pos_embeds);
+            require_extract(ex.extract("out0", pos_embeds), pos_embeds, "vision_embed_pos/out0");
         }
         
         pos_embeds = reorder_patches_for_merge(pos_embeds, num_patches_h, num_patches_w, spatial_merge_size);
 
         ncnn::Mat emb_cos, emb_sin;
         generate_vision_rope_cache_2d(num_patches_h, num_patches_w, spatial_merge_size,
-                                      10000.0f, {16, 16}, true, emb_cos, emb_sin);
+                                      10000.0f, vision_rope_section, true, emb_cos, emb_sin);
 
         {
             ncnn::Extractor ex = vision_encoder->create_extractor();
@@ -1294,7 +1459,23 @@ int ncnn_llm_gpt::get_visiual_features(const ncnn::Mat& bgr, ncnn::Mat& image_em
             ex.input("in1", pos_embeds);
             ex.input("in2", emb_cos);
             ex.input("in3", emb_sin);
-            ex.extract("out0", image_embeds);
+            require_extract(ex.extract("out0", image_embeds), image_embeds, "vision_encoder/out0");
+            float vision_min = image_embeds[0];
+            float vision_max = image_embeds[0];
+            double vision_sum = 0.0;
+            double vision_sq_sum = 0.0;
+            for (size_t i = 0; i < image_embeds.total(); ++i) {
+                const float value = image_embeds[i];
+                vision_min = std::min(vision_min, value);
+                vision_max = std::max(vision_max, value);
+                vision_sum += value;
+                vision_sq_sum += (double)value * value;
+            }
+            const double vision_mean = vision_sum / image_embeds.total();
+            const double vision_std = std::sqrt(vision_sq_sum / image_embeds.total() - vision_mean * vision_mean);
+            fprintf(stderr, "[qwen3.5 vision] shape=%d x %d range=[%g,%g] mean=%g std=%g first=%g,%g,%g,%g\n",
+                    image_embeds.h, image_embeds.w, vision_min, vision_max, vision_mean, vision_std,
+                    image_embeds[0], image_embeds[1], image_embeds[2], image_embeds[3]);
         }
         return 0;
     }
@@ -1349,15 +1530,14 @@ int ncnn_llm_gpt::get_visiual_features(const ncnn::Mat& bgr, ncnn::Mat& image_em
         ex.input("in1", emb_cos_reordered);
         ex.input("in2", emb_sin_reordered);
         ex.input("in3", attention_mask);
-        ex.extract("out0", image_embeds);
+        require_extract(ex.extract("out0", image_embeds), image_embeds, "vision_encoder/out0");
     }
 
     ncnn::Mat image_embeds_restored(image_embeds.w, image_embeds.h);
     for (int i = 0; i < window_index.size(); i++) {
-        int dest_group_idx = window_index[i];
-        int src_group_idx = i;
-        const float* src_ptr = image_embeds.row(dest_group_idx);
-        float* dst_ptr = image_embeds_restored.row(src_group_idx);
+        const int original_group_idx = window_index[i];
+        const float* src_ptr = image_embeds.row(i);
+        float* dst_ptr = image_embeds_restored.row(original_group_idx);
         memcpy(dst_ptr, src_ptr, image_embeds.w * sizeof(float));
     }
     image_embeds = image_embeds_restored;

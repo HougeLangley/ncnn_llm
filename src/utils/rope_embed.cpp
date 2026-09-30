@@ -1,4 +1,5 @@
 #include "rope_embed.h"
+#include <algorithm>
 #include <cmath>
 #include <vector>
 #include <cstring>
@@ -164,19 +165,18 @@ void generate_rope_embed_cache_vision_mrope_interleaved(int seqlen,
                                                         int image_pad_index,
                                                         int image_embeds_size,
                                                         int num_patches_w,
+                                                        int num_patches_h,
                                                         ncnn::Mat& cos_cache,
                                                         ncnn::Mat& sin_cache,
                                                         float rope_theta)
 {
     const int merge_size = 2;
     const int mrope[3] = {11, 11, 10};
-    const float partial_rotary_factor = 0.5f;
-    const int rotate_dim = embed_dim * partial_rotary_factor;
 
-    std::vector<float> inv_freq(rotate_dim / 2);
-    for (int i = 0; i < rotate_dim / 2; i++)
+    std::vector<float> inv_freq(embed_dim / 2);
+    for (int i = 0; i < embed_dim / 2; i++)
     {
-        inv_freq[i] = 1.f / powf(rope_theta, (float)(i * 2) / rotate_dim);
+        inv_freq[i] = 1.f / powf(rope_theta, (float)(i * 2) / embed_dim);
     }
 
     cos_cache.create(embed_dim / 2, seqlen);
@@ -189,57 +189,44 @@ void generate_rope_embed_cache_vision_mrope_interleaved(int seqlen,
 
         for (int j = 0; j < embed_dim / 2; j++)
         {
-            if (j < rotate_dim / 2)
+            int which_pos = 0;
+            if (j < mrope[1] * 3 && (j % 3 == 1))
             {
-                int pos = position_id;
-                if (i < image_pad_index)
-                {
-                    pos += i;
-                }
-                else if (i >= image_pad_index + image_embeds_size)
-                {
-                    pos += i - image_embeds_size + (num_patches_w / merge_size);
-                }
-                else
-                {
-                    int which_pos = 0;
+                which_pos = 1;
+            }
+            else if (j < mrope[2] * 3 && (j % 3 == 2))
+            {
+                which_pos = 2;
+            }
 
-                    if (j < mrope[1] * 3 && (j % 3 == 1))
-                    {
-                        which_pos = 1;
-                    }
-                    else if (j < mrope[2] * 3 && (j % 3 == 2))
-                    {
-                        which_pos = 2;
-                    }
-
-                    if (which_pos == 0)
-                    {
-                        pos += image_pad_index;
-                    }
-                    else if (which_pos == 1)
-                    {
-                        int hid = (i - image_pad_index) / (num_patches_w / merge_size);
-                        pos += image_pad_index + hid;
-                    }
-                    else
-                    {
-                        int wid = (i - image_pad_index) % (num_patches_w / merge_size);
-                        pos += image_pad_index + wid;
-                    }
-                }
-
-                const float t = pos * inv_freq[j];
-                const float cos_val = cosf(t);
-                const float sin_val = sinf(t);
-                *cos_ptr++ = cos_val;
-                *sin_ptr++ = sin_val;
+            int pos = position_id;
+            if (i < image_pad_index)
+            {
+                pos += i;
+            }
+            else if (i >= image_pad_index + image_embeds_size)
+            {
+                pos += i - image_embeds_size +
+                       (std::max(num_patches_w, num_patches_h) / merge_size);
+            }
+            else if (which_pos == 0)
+            {
+                pos += image_pad_index;
+            }
+            else if (which_pos == 1)
+            {
+                int hid = (i - image_pad_index) / (num_patches_w / merge_size);
+                pos += image_pad_index + hid;
             }
             else
             {
-                *cos_ptr++ = 1.0f;
-                *sin_ptr++ = 0.0f;
+                int wid = (i - image_pad_index) % (num_patches_w / merge_size);
+                pos += image_pad_index + wid;
             }
+
+            const float t = pos * inv_freq[j];
+            *cos_ptr++ = cosf(t);
+            *sin_ptr++ = sinf(t);
         }
     }
 }
@@ -302,7 +289,22 @@ void generate_rope_embed_cache_LongRoPE(int seqlen,
 void inject_image_embeds(std::vector<int>& token_ids, ncnn::Mat& token_embed, int& image_pad_index, int image_pad_id, const ncnn::Mat& image_embeds)
 {
     image_pad_index = -1;
-    if (image_embeds.empty())
+    if (image_embeds.empty() || token_ids.empty() || token_embed.empty() || image_pad_id < 0 ||
+        token_embed.h != (int)token_ids.size() || token_embed.w != image_embeds.w)
+    {
+        return;
+    }
+
+    int placeholder_index = -1;
+    for (int i = 0; i < (int)token_ids.size(); i++)
+    {
+        if (token_ids[i] == image_pad_id)
+        {
+            placeholder_index = i;
+            break;
+        }
+    }
+    if (placeholder_index < 0)
     {
         return;
     }
@@ -310,25 +312,19 @@ void inject_image_embeds(std::vector<int>& token_ids, ncnn::Mat& token_embed, in
     std::vector<int> token_ids_injected(token_ids.size() - 1 + image_embeds.h);
     ncnn::Mat token_embed_injected(token_embed.w, token_embed.h - 1 + image_embeds.h);
 
-    for (int i = 0; i < (int)token_ids.size(); i++)
-    {
-        if (token_ids[i] == image_pad_id)
-        {
-            image_pad_index = i;
+    image_pad_index = placeholder_index;
 
-            // inject token ids
-            memcpy(token_ids_injected.data(), token_ids.data(), i * sizeof(int));
-            memset(token_ids_injected.data() + i, image_pad_id, image_embeds.h * sizeof(int));
-            memcpy(token_ids_injected.data() + i + image_embeds.h, token_ids.data() + i + 1, (token_ids.size() - 1 - i) * sizeof(int));
+    memcpy(token_ids_injected.data(), token_ids.data(), placeholder_index * sizeof(int));
+    memset(token_ids_injected.data() + placeholder_index, image_pad_id, image_embeds.h * sizeof(int));
+    memcpy(token_ids_injected.data() + placeholder_index + image_embeds.h,
+           token_ids.data() + placeholder_index + 1,
+           (token_ids.size() - 1 - placeholder_index) * sizeof(int));
 
-            // inject token embed
-            memcpy(token_embed_injected.row(0), token_embed.row(0), i * token_embed.w * sizeof(float));
-            memcpy(token_embed_injected.row(i), image_embeds.row(0), image_embeds.h * token_embed.w * sizeof(float));
-            memcpy(token_embed_injected.row(i + image_embeds.h), token_embed.row(i + 1), (token_ids.size() - 1 - i) * token_embed.w * sizeof(float));
-
-            break;
-        }
-    }
+    memcpy(token_embed_injected.row(0), token_embed.row(0), placeholder_index * token_embed.w * sizeof(float));
+    memcpy(token_embed_injected.row(placeholder_index), image_embeds.row(0), image_embeds.h * token_embed.w * sizeof(float));
+    memcpy(token_embed_injected.row(placeholder_index + image_embeds.h),
+           token_embed.row(placeholder_index + 1),
+           (token_ids.size() - 1 - placeholder_index) * token_embed.w * sizeof(float));
 
     token_ids = token_ids_injected;
     token_embed = token_embed_injected;

@@ -21,6 +21,15 @@ TemplateType detect_template_type(const std::string& model_path) {
             if (type == "youtu_llm") {
                 return TemplateType::YOUTU;
             }
+            if (type == "qwen3") {
+                return TemplateType::QWEN3;
+            }
+            if (type == "minicpm5") {
+                return TemplateType::MINICPM5;
+            }
+            if (type == "qwen3.5") {
+                return TemplateType::QWEN35;
+            }
         }
     } catch (...) {
     }
@@ -35,14 +44,19 @@ int run_cli(const Options& opt,
             TemplateType template_type,
             const ncnn::Mat& image) {
     std::cout << "llm_ncnn_run (cli). Type 'exit' or 'quit' to end the conversation.\n";
-    std::cout << "Using template: " << (template_type == TemplateType::YOUTU ? "YouTu" : "ChatML") << "\n";
+    const char* template_name = template_type == TemplateType::YOUTU ? "YouTu" :
+                                template_type == TemplateType::QWEN3 ? "Qwen3" :
+                                template_type == TemplateType::MINICPM5 ? "MiniCPM5" :
+                                template_type == TemplateType::QWEN35 ? "Qwen3.5" : "ChatML";
+    std::cout << "Using template: " << template_name << "\n";
 
     std::string system_prompt = "You are a helpful assistant.";
-    std::string prompt = apply_chat_template(template_type, {{"system", system_prompt}}, {}, false, false);
-    auto ctx = model.prefill(prompt);
-
-    if (!builtin_tools.empty()) {
-        ctx = model.define_tools(ctx, builtin_tools, system_prompt);
+    std::shared_ptr<ncnn_llm_gpt_ctx> ctx;
+    if (!builtin_tools.empty() && model.supports_tool_calling()) {
+        ctx = model.define_tools(nullptr, builtin_tools, system_prompt, template_type);
+    } else {
+        std::string prompt = apply_chat_template(template_type, {{"system", system_prompt}}, {}, false, false);
+        ctx = model.prefill(prompt);
     }
 
     bool has_image = !ncnn_mat_empty(image);
@@ -57,22 +71,25 @@ int run_cli(const Options& opt,
         if (first_turn && has_image) {
             std::string user_message = apply_chat_template(template_type, {
                 {"user", "<|vision_start|><|image_pad|><|vision_end|>" + input}
-            }, {}, true, false);
+            }, {}, true, opt.enable_thinking);
             ctx = model.prefill(user_message, image, ctx);
             first_turn = false;
         } else {
             std::string user_message = apply_chat_template(template_type, {
                 {"user", input}
-            }, {}, true, false);
+            }, {}, true, opt.enable_thinking);
             ctx = model.prefill(user_message, ctx);
         }
 
         std::cout << "Assistant: ";
         GenerateConfig cfg;
-        cfg.top_k = 40;
-        cfg.top_p = 0.9f;
-        cfg.temperature = 0.7f;
-        cfg.do_sample = false;
+        cfg.max_new_tokens = opt.max_new_tokens;
+        cfg.top_k = opt.top_k;
+        cfg.top_p = opt.top_p;
+        cfg.temperature = opt.temperature;
+        cfg.repetition_penalty = opt.repetition_penalty;
+        cfg.do_sample = opt.do_sample;
+        cfg.enable_thinking = opt.enable_thinking;
 
         cfg.tool_callback = [&](const json& call) {
             json result;

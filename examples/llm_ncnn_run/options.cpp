@@ -19,7 +19,14 @@ void print_usage(const char* argv0) {
         << "  --use-vulkan               Enable Vulkan backend\n"
         << "  --vulkan-device <index>    Vulkan device index (default: 0)\n"
         << "  --threads <num>            Number of CPU threads (default: auto)\n"
+        << "  --max-new-tokens <num>     Maximum generated tokens (default: 512)\n"
+        << "  --temperature <val>        Sampling temperature (default: 0.7)\n"
+        << "  --top-p <val>              Top-p sampling cutoff (default: 0.9)\n"
+        << "  --top-k <num>              Top-k sampling cutoff (default: 40)\n"
+        << "  --repetition-penalty <val> Repetition penalty (default: 1.1)\n"
+        << "  --do-sample                Enable stochastic sampling\n"
         << "  --no-builtin-tools         Disable built-in tools (random/add)\n"
+        << "  --enable-thinking          Enable model reasoning output (<think>...</think>)\n"
         << "  --help                     Show this help\n"
         << "\n"
         << "Examples:\n"
@@ -67,8 +74,31 @@ Options parse_options(int argc, char** argv) {
                 std::exit(2);
             }
             opt.num_threads = std::atoi(argv[++i]);
+        } else if (a == "--max-new-tokens") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --max-new-tokens\n";
+                std::exit(2);
+            }
+            opt.max_new_tokens = std::atoi(argv[++i]);
+            if (opt.max_new_tokens <= 0) opt.max_new_tokens = 512;
         } else if (a == "--no-builtin-tools") {
             opt.enable_builtin_tools = false;
+        } else if (a == "--enable-thinking" || a == "--thinking") {
+            opt.enable_thinking = true;
+        } else if (a == "--temperature" || a == "--temp") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for " << a << "\n"; std::exit(2); }
+            opt.temperature = std::atof(argv[++i]);
+        } else if (a == "--top-p") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --top-p\n"; std::exit(2); }
+            opt.top_p = std::atof(argv[++i]);
+        } else if (a == "--top-k") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --top-k\n"; std::exit(2); }
+            opt.top_k = std::atoi(argv[++i]);
+        } else if (a == "--repetition-penalty" || a == "--rep-penalty") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for " << a << "\n"; std::exit(2); }
+            opt.repetition_penalty = std::atof(argv[++i]);
+        } else if (a == "--do-sample" || a == "--sample") {
+            opt.do_sample = true;
         } else {
             std::cerr << "Unknown option: " << a << "\n";
             print_usage(argv[0]);

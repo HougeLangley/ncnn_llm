@@ -8,6 +8,9 @@ using json = nlohmann::json;
 // Template type enum
 enum class TemplateType {
     CHATML,     // Qwen3, MiniCPM4 style <|im_start|>...<|im_end|>
+    QWEN3,      // Qwen3 ChatML with an explicit thinking block toggle
+    MINICPM5,   // MiniCPM5 ChatML with an explicit empty thinking block
+    QWEN35,     // Qwen3.5 official tool-call XML format
     YOUTU       // YouTu LLM style <|User|>...<|Assistant|>
 };
 

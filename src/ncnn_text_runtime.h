@@ -1,5 +1,6 @@
 #pragma once
 
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -32,6 +33,11 @@ ncnn::Mat llm_run_decoder_with_kv(ncnn::Net& decoder_net,
                                   int max_seqlen_hint = 0);
 
 ncnn::Mat llm_run_lm_head(ncnn::Net& lm_head_net, const ncnn::Mat& hidden_states);
+
+int llm_select_next_token(const ncnn::Mat& logits,
+                          const std::unordered_map<int, int>& history_counts,
+                          const LlmTokenSampleConfig& cfg,
+                          const std::vector<int>* generated_tokens = nullptr);
 
 int llm_select_next_token(const ncnn::Mat& logits,
                           const std::unordered_set<int>& history,

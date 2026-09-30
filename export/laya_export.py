@@ -1,5 +1,5 @@
 ﻿# Copyright (c) 2026 ncnn_llm authors. All rights reserved.
-# Use of this source code is governed by a BSD-style license.
+# Use of this source code is governed by a Apache License 2.0.
 
 import argparse
 import json

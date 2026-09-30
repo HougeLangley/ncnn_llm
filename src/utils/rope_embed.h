@@ -66,6 +66,7 @@ void generate_rope_embed_cache_vision_mrope_interleaved(int seqlen,
                                                         int image_pad_index,
                                                         int image_embeds_size,
                                                         int num_patches_w,
+                                                        int num_patches_h,
                                                         ncnn::Mat& cos_cache,
                                                         ncnn::Mat& sin_cache,
                                                         float rope_theta = 100000);

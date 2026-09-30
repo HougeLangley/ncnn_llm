@@ -1,445 +1,368 @@
+// benchmark/benchllm.cpp
+//
+// Qwen3-0.6B bf16 / int8 end-to-end benchmark, llama.cpp style:
+//   pp256 = prefill a prompt of EXACTLY 256 tokens, measure wall time
+//   tg64  = autoregressive decode of 64 tokens, measure ms/token
+//
+// The prompt is built with a mirrored BpeTokenizer (same vocab/merges/byte-encoder
+// config as ncnn_llm_gpt) and verified by an encode -> decode -> re-encode fixed
+// point check, so the token count fed into prefill is exact, not approximate.
+//
+// usage: benchllm [loop_count] [threads] [powersave] [gpu_device] [cooling_down] [pp] [tg]
+//   Any numeric argument <= 0 (or omitted) falls back to the default.
+//   loop_count    measured passes per model (default 4)
+//   threads       cpu threads (default 4)
+//   powersave     0 = all cores, 1 = little only, 2 = big only (default 2)
+//   gpu_device    -1 = CPU (default), >=0 = vulkan device index
+//   cooling_down  1 = sleep between passes (default 0)
+//   pp            prefill token count (default 256)
+//   tg            decode token count (default 64)
+
 #include <float.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
-#include <algorithm>
-#include <iostream>
-#include <fstream>
 
 #include <net.h>
 #include <benchmark.h>
 #include <cpu.h>
-#include <datareader.h>
-#include <layer_type.h>
 
 #include "ncnn_llm_gpt.h"
+#include "utils/tokenizer/bpe_tokenizer.h"
 
-class DataReaderFromEmpty : public ncnn::DataReader
+static const char* PROMPT_SEED =
+    "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. "
+    "How vexingly quick daft zebras jump! Sphinx of black quartz, judge my vow. "
+    "The five boxing wizards jump quickly over the sleepy dog again and again. ";
+
+struct ModelResult
 {
-public:
-    virtual int scan(const char* format, void* p) const
-    {
-        return 0;
-    }
-    virtual size_t read(void* buf, size_t size) const
-    {
-        memset(buf, 0, size);
-        return size;
-    }
-};
-
-static int g_warmup_loop_count = 4;
-static int g_loop_count = 4;
-static bool g_enable_cooling_down = false;
-
-struct BenchResult
-{
+    bool ran = false;
     std::string name;
-    double prefill_min;
-    double prefill_avg;
-    double decode_min;
-    double decode_avg;
+    std::string label;
+    std::string dir;
+    int pp_tokens = 0;      // verified prefill token count
+    int tg_tokens = 0;      // requested decode token count
+    double pp_min = DBL_MAX;
+    double pp_avg = 0;
+    double pp_tps = 0;
+    double tg_ms_min = DBL_MAX;   // ms per token
+    double tg_ms_avg = 0;         // ms per token
+    double tg_tps = 0;
+    int tg_actual = 0;      // sum of actually generated tokens across passes
+    std::string sample_text;
 };
 
-BenchResult benchmark_decoder(const char* comment, int hidden_size, int half_embed_dim, int seqlen, const ncnn::Option& opt, const std::string& param_path, bool use_mempool = true)
+// Resolve a model directory by trying several relative search paths.
+static std::string resolve_model_dir(const std::string& name)
 {
-    BenchResult res = {comment, DBL_MAX, 0, DBL_MAX, 0};
-
-    if (!std::filesystem::exists(param_path))
+    const char* search_paths[] = {
+        "./assets", ".", "../assets", "../", "../../assets", "../../"
+    };
+    for (const char* base : search_paths)
     {
-        return res;
+        std::string dir = std::string(base) + "/" + name;
+        if (std::filesystem::exists(dir + "/model.json"))
+            return dir;
     }
-
-    ncnn::Net net;
-    net.opt = opt;
-
-    if (net.load_param(param_path.c_str()) != 0)
-    {
-        fprintf(stderr, "Failed to load param: %s\n", param_path.c_str());
-        return res;
-    }
-
-    DataReaderFromEmpty dr;
-    net.load_model(dr);
-
-    // resolve kv cache blob indexes
-    std::vector<int> kv_cache_indexes;
-    std::vector<int> out_kv_cache_indexes;
-    {
-        for (size_t i = 0; i < net.layers().size(); i++)
-        {
-            const ncnn::Layer* op = net.layers()[i];
-            if (op->typeindex != ncnn::LayerType::SDPA)
-                continue;
-
-            const size_t input_count = op->bottoms.size();
-            const size_t output_count = op->tops.size();
-
-            if (output_count == 3)
-            {
-                kv_cache_indexes.push_back(op->bottoms[input_count - 2]);
-                kv_cache_indexes.push_back(op->bottoms[input_count - 1]);
-                out_kv_cache_indexes.push_back(op->tops[output_count - 2]);
-                out_kv_cache_indexes.push_back(op->tops[output_count - 1]);
-            }
-        }
-    }
-
-    if (g_enable_cooling_down)
-    {
-        ncnn::sleep(10 * 1000);
-    }
-
-    ncnn::UnlockedPoolAllocator kvcache_allocator;
-    kvcache_allocator.set_size_compare_ratio(0.f);
-
-    std::vector<ncnn::Mat> kvcache;
-
-    // prefill
-    {
-        const int cur_seqlen = seqlen;
-        const int past_seqlen = 0;
-
-        ncnn::Mat token_embeds(hidden_size, cur_seqlen);
-        token_embeds.fill(0.1f);
-        ncnn::Mat attention_mask(past_seqlen + cur_seqlen, cur_seqlen);
-        attention_mask.fill(0.f);
-        for (int i = 0; i < cur_seqlen; i++)
-        {
-            float* row = attention_mask.row(i);
-            for (int j = past_seqlen + i + 1; j < past_seqlen + cur_seqlen; j++)
-            {
-                row[j] = -10000.f;
-            }
-        }
-        ncnn::Mat cos_cache(half_embed_dim, cur_seqlen);
-        cos_cache.fill(1.f);
-        ncnn::Mat sin_cache(half_embed_dim, cur_seqlen);
-        sin_cache.fill(0.f);
-
-        std::vector<ncnn::Mat> out_kvcache;
-        ncnn::Mat output_states;
-
-        // warm up
-        for (int i = 0; i < g_warmup_loop_count; i++)
-        {
-            ncnn::Extractor ex = net.create_extractor();
-            if (use_mempool)
-            {
-                ex.set_kvcache_allocator(&kvcache_allocator);
-                ex.set_kvcache_max_seqlen_hint(seqlen + 128);
-            }
-            ex.input("in0", token_embeds);
-            ex.input("in1", attention_mask);
-            ex.input("in2", cos_cache);
-            ex.input("in3", sin_cache);
-
-            out_kvcache.resize(out_kv_cache_indexes.size());
-            for (size_t k = 0; k < out_kv_cache_indexes.size(); k++)
-            {
-                ex.extract(out_kv_cache_indexes[k], out_kvcache[k], 1);
-            }
-            ex.extract("out0", output_states);
-        }
-
-        double time_min = DBL_MAX;
-        double time_avg = 0;
-
-        for (int i = 0; i < g_loop_count; i++)
-        {
-            double start = ncnn::get_current_time();
-            {
-                ncnn::Extractor ex = net.create_extractor();
-                if (use_mempool)
-                {
-                    ex.set_kvcache_allocator(&kvcache_allocator);
-                    ex.set_kvcache_max_seqlen_hint(seqlen + 128);
-                }
-                ex.input("in0", token_embeds);
-                ex.input("in1", attention_mask);
-                ex.input("in2", cos_cache);
-                ex.input("in3", sin_cache);
-
-                out_kvcache.resize(out_kv_cache_indexes.size());
-                for (size_t k = 0; k < out_kv_cache_indexes.size(); k++)
-                {
-                    ex.extract(out_kv_cache_indexes[k], out_kvcache[k], 1);
-                }
-                ex.extract("out0", output_states);
-            }
-            double end = ncnn::get_current_time();
-            double time = end - start;
-
-            time_min = std::min(time_min, time);
-            time_avg += time;
-        }
-
-        time_avg /= g_loop_count;
-        res.prefill_min = time_min;
-        res.prefill_avg = time_avg;
-        kvcache = out_kvcache;
-    }
-
-    // decode step
-    {
-        const int cur_seqlen = 1;
-        const int past_seqlen = seqlen;
-
-        ncnn::Mat token_embeds(hidden_size, cur_seqlen);
-        token_embeds.fill(0.1f);
-        ncnn::Mat attention_mask(past_seqlen + cur_seqlen, cur_seqlen);
-        attention_mask.fill(0.f);
-        ncnn::Mat cos_cache(half_embed_dim, cur_seqlen);
-        cos_cache.fill(1.f);
-        ncnn::Mat sin_cache(half_embed_dim, cur_seqlen);
-        sin_cache.fill(0.f);
-
-        std::vector<ncnn::Mat> out_kvcache;
-        ncnn::Mat output_states;
-
-        // warm up
-        for (int i = 0; i < g_warmup_loop_count; i++)
-        {
-            const int cur_past = kvcache.empty() ? past_seqlen : kvcache[0].h;
-            ncnn::Mat cur_mask(cur_past + cur_seqlen, cur_seqlen);
-            cur_mask.fill(0.f);
-
-            ncnn::Extractor ex = net.create_extractor();
-            if (use_mempool)
-            {
-                ex.set_kvcache_allocator(&kvcache_allocator);
-                ex.set_kvcache_max_seqlen_hint(seqlen + 128);
-            }
-            ex.input("in0", token_embeds);
-            ex.input("in1", cur_mask);
-            ex.input("in2", cos_cache);
-            ex.input("in3", sin_cache);
-
-            for (size_t k = 0; k < kv_cache_indexes.size(); k++)
-            {
-                ex.input(kv_cache_indexes[k], kvcache[k]);
-                if (use_mempool)
-                {
-                    kvcache[k].release();
-                }
-            }
-
-            out_kvcache.resize(out_kv_cache_indexes.size());
-            for (size_t k = 0; k < out_kv_cache_indexes.size(); k++)
-            {
-                ex.extract(out_kv_cache_indexes[k], out_kvcache[k], 1);
-            }
-            ex.extract("out0", output_states);
-            kvcache = out_kvcache;
-        }
-
-        double time_min = DBL_MAX;
-        double time_avg = 0;
-
-        for (int i = 0; i < g_loop_count; i++)
-        {
-            const int cur_past = kvcache.empty() ? past_seqlen : kvcache[0].h;
-            ncnn::Mat cur_mask(cur_past + cur_seqlen, cur_seqlen);
-            cur_mask.fill(0.f);
-
-            double start = ncnn::get_current_time();
-            {
-                ncnn::Extractor ex = net.create_extractor();
-                if (use_mempool)
-                {
-                    ex.set_kvcache_allocator(&kvcache_allocator);
-                    ex.set_kvcache_max_seqlen_hint(seqlen + 128);
-                }
-                ex.input("in0", token_embeds);
-                ex.input("in1", cur_mask);
-                ex.input("in2", cos_cache);
-                ex.input("in3", sin_cache);
-
-                for (size_t k = 0; k < kv_cache_indexes.size(); k++)
-                {
-                    ex.input(kv_cache_indexes[k], kvcache[k]);
-                    if (use_mempool)
-                    {
-                        kvcache[k].release();
-                    }
-                }
-
-                out_kvcache.resize(out_kv_cache_indexes.size());
-                for (size_t k = 0; k < out_kv_cache_indexes.size(); k++)
-                {
-                    ex.extract(out_kv_cache_indexes[k], out_kvcache[k], 1);
-                }
-                ex.extract("out0", output_states);
-                kvcache = out_kvcache;
-            }
-            double end = ncnn::get_current_time();
-            double time = end - start;
-
-            time_min = std::min(time_min, time);
-            time_avg += time;
-        }
-
-        time_avg /= g_loop_count;
-        res.decode_min = time_min;
-        res.decode_avg = time_avg;
-    }
-
-    fprintf(stderr, "%30s (prefill)  min = %7.2f ms  avg = %7.2f ms\n", comment, res.prefill_min, res.prefill_avg);
-    fprintf(stderr, "%30s  (decode)  min = %7.2f ms  avg = %7.2f ms\n", comment, res.decode_min, res.decode_avg);
-
-    return res;
+    return "";
 }
 
-struct E2EResult
+// Load a tokenizer with exactly the same construction as ncnn_llm_gpt,
+// so token counts computed here match what prefill() will do internally.
+static std::unique_ptr<BpeTokenizer> load_tokenizer(const std::string& dir)
 {
-    double prefill_ms;
-    int token_count;
-    double decode_ms;
-    double decode_tps;
-    double ms_per_token;
-};
-
-E2EResult benchmark_e2e_qwen3_single(int num_threads, const std::string& decoder_param_name)
-{
-    E2EResult res = {0, 0, 0, 0, 0};
-    std::string model_dir = "../qwen3_0.6b";
-    if (!std::filesystem::exists(model_dir + "/model.json"))
+    nlohmann::json config;
     {
-        model_dir = "assets/qwen3_0.6b";
-        if (!std::filesystem::exists(model_dir + "/model.json"))
-            return res;
-    }
-
-    std::string model_json_path = model_dir + "/model.json";
-    json config;
-    {
-        std::ifstream ifs(model_json_path);
+        std::ifstream ifs(dir + "/model.json");
         ifs >> config;
     }
-    std::string orig_decoder_param = config["params"]["decoder_param"].get<std::string>();
 
-    config["params"]["decoder_param"] = decoder_param_name;
+    std::string type = "bpe";
+    if (config["tokenizer"].contains("type"))
+        type = config["tokenizer"]["type"].get<std::string>();
+
+    std::string vocab_file = dir + "/" + config["tokenizer"]["vocab_file"].get<std::string>();
+    std::string merges_file = dir + "/" + config["tokenizer"]["merges_file"].get<std::string>();
+
+    std::unique_ptr<BpeTokenizer> tok(new BpeTokenizer(BpeTokenizer::LoadFromFiles(
+        vocab_file, merges_file, SpecialTokensConfig{}, false, true, type == "bbpe")));
+
+    if (config["tokenizer"].contains("additional_special_tokens"))
     {
-        std::ofstream ofs(model_json_path);
-        ofs << config.dump(2);
+        for (const auto& t : config["tokenizer"]["additional_special_tokens"].get<std::vector<std::string>>())
+            tok->AddAdditionalSpecialToken(t);
+    }
+    return tok;
+}
+
+// Build a plain-text prompt that encodes to exactly `n` tokens.
+static std::string build_prompt_of_tokens(const BpeTokenizer& tok, int n, int& actual_tokens)
+{
+    std::vector<int> ids = tok.encode(PROMPT_SEED, false, false);
+    while ((int)ids.size() < n)
+    {
+        std::vector<int> more = tok.encode(PROMPT_SEED, false, false);
+        ids.insert(ids.end(), more.begin(), more.end());
+    }
+    if ((int)ids.size() > n)
+        ids.resize(n);
+
+    // Byte-level BPE round-trips exactly, so the first iteration is normally
+    // already a fixed point. Iterate a few times just in case.
+    for (int it = 0; it < 8; it++)
+    {
+        std::string text = tok.decode(ids, false);
+        std::vector<int> re = tok.encode(text, false, false);
+        if ((int)re.size() == n)
+        {
+            actual_tokens = n;
+            return text;
+        }
+
+        std::vector<int> next = re;
+        if ((int)next.size() > n)
+            next.resize(n);
+        while ((int)next.size() < n)
+        {
+            std::vector<int> more = tok.encode(PROMPT_SEED, false, false);
+            next.insert(next.end(), more.begin(), more.end());
+        }
+        if ((int)next.size() > n)
+            next.resize(n);
+        ids = next;
     }
 
+    // Fallback: decode without fixed-point guarantee, report the real count.
+    std::string text = tok.decode(ids, false);
+    actual_tokens = (int)tok.encode(text, false, false).size();
+    return text;
+}
+
+struct PassResult
+{
+    double prefill_ms;
+    int prefill_tokens;
+    double decode_ms;
+    int decode_tokens;
+    std::string text;
+};
+
+static PassResult run_pass(ncnn_llm_gpt& model, const std::string& prompt, int pp_tokens, int tg_tokens)
+{
+    PassResult r = {0, pp_tokens, 0, 0, ""};
+
+    double t0 = ncnn::get_current_time();
+    auto ctx = model.prefill(prompt);
+    double t1 = ncnn::get_current_time();
+
+    GenerateConfig cfg;
+    cfg.max_new_tokens = tg_tokens;
+    cfg.temperature = 0.f;
+    cfg.do_sample = 0;
+    cfg.repetition_penalty = 1.f;
+
+    int tokens = 0;
+    std::string text;
+    double t2 = ncnn::get_current_time();
+    model.generate(ctx, cfg, [&](const std::string& token) {
+        tokens++;
+        text += token;
+    });
+    double t3 = ncnn::get_current_time();
+
+    r.prefill_ms = t1 - t0;
+    r.decode_ms = t3 - t2;
+    r.decode_tokens = tokens;
+    r.text = text;
+    return r;
+}
+
+static std::string one_line(const std::string& s, size_t max_len)
+{
+    std::string out;
+    for (char c : s)
     {
-        ncnn_llm_gpt model(model_dir, false, num_threads);
-
-        std::string prompt = "Please write a short poem about summer.";
-        double t0 = ncnn::get_current_time();
-        auto ctx = model.prefill(prompt);
-        double t1 = ncnn::get_current_time();
-        res.prefill_ms = t1 - t0;
-
-        GenerateConfig cfg;
-        cfg.max_new_tokens = 32;
-        int token_count = 0;
-        std::string output_text;
-
-        double t2 = ncnn::get_current_time();
-        model.generate(ctx, cfg, [&](const std::string& token) {
-            token_count++;
-            output_text += token;
-        });
-        double t3 = ncnn::get_current_time();
-        res.decode_ms = t3 - t2;
-        res.token_count = token_count;
-        res.decode_tps = (token_count > 0 && res.decode_ms > 0) ? (token_count * 1000.0 / res.decode_ms) : 0.0;
-        res.ms_per_token = token_count > 0 ? (res.decode_ms / token_count) : 0.0;
+        if (c == '\n' || c == '\r' || c == '\t') out += ' ';
+        else out += c;
+        if (out.size() >= max_len) break;
     }
-
-    // restore model.json
-    config["params"]["decoder_param"] = orig_decoder_param;
-    {
-        std::ofstream ofs(model_json_path);
-        ofs << config.dump(2);
-    }
-
-    return res;
+    return out;
 }
 
 int main(int argc, char** argv)
 {
-    int loop_count = 4;
-    int num_threads = ncnn::get_physical_big_cpu_count();
+    // Sentinels: 0 or negative for any numeric argument = use the default.
+    int loop_count = 0;
+    int num_threads = 0;
     int powersave = 2;
     int gpu_device = -1;
     int cooling_down = 0;
-    int seqlen = 233;
+    int pp_tokens = 0;
+    int tg_tokens = 0;
 
     if (argc >= 2) loop_count = atoi(argv[1]);
     if (argc >= 3) num_threads = atoi(argv[2]);
     if (argc >= 4) powersave = atoi(argv[3]);
     if (argc >= 5) gpu_device = atoi(argv[4]);
     if (argc >= 6) cooling_down = atoi(argv[5]);
-    if (argc >= 7) seqlen = atoi(argv[6]);
+    if (argc >= 7) pp_tokens = atoi(argv[6]);
+    if (argc >= 8) tg_tokens = atoi(argv[7]);
 
-    bool use_vulkan_compute = gpu_device != -1;
-    g_enable_cooling_down = cooling_down != 0;
-    g_loop_count = loop_count;
+    // Sanitize: never trust a non-positive value.
+    if (loop_count <= 0) loop_count = 4;
+    if (num_threads <= 0) num_threads = 4;      // fixed default per user request
+    if (powersave < 0 || powersave > 2) powersave = 2;
+    if (gpu_device < -1) gpu_device = -1;
+    if (cooling_down != 0 && cooling_down != 1) cooling_down = 0;
+    if (pp_tokens <= 0) pp_tokens = 256;
+    if (tg_tokens <= 0) tg_tokens = 64;
+
+    bool use_vulkan = gpu_device != -1;
 
     ncnn::set_cpu_powersave(powersave);
     ncnn::set_omp_dynamic(0);
     ncnn::set_omp_num_threads(num_threads);
 
-    ncnn::Option opt;
-    opt.num_threads = num_threads;
-    opt.use_vulkan_compute = use_vulkan_compute;
-
     fprintf(stderr, "========================================================================\n");
-    fprintf(stderr, " ncnn LLM Performance Benchmark: PR #6923 GQA & KVCache Memory Pool    \n");
+    fprintf(stderr, "  ncnn LLM Benchmark: Qwen3-0.6B bf16 vs int8 (E2E pp/tg)               \n");
     fprintf(stderr, "========================================================================\n");
-    fprintf(stderr, "Threads = %d, Seqlen = %d, Loop = %d\n\n", num_threads, seqlen, g_loop_count);
+    fprintf(stderr, "Threads = %d, PP = %d, TG = %d, Loop = %d, Vulkan = %s\n\n",
+            num_threads, pp_tokens, tg_tokens, loop_count, use_vulkan ? "on" : "off");
 
-    fprintf(stderr, "--- 1. Decoder Subgraph Benchmark (minicpm4_0.5b) ---\n");
-    bool has_mcpm_old = std::filesystem::exists("minicpm4_decoder_old.ncnn.param");
-    BenchResult mcpm_before  = has_mcpm_old ? benchmark_decoder("minicpm4 (Before PR6923)", 1024, 32, seqlen, opt, "minicpm4_decoder_old.ncnn.param", false) : BenchResult{};
-    BenchResult mcpm_gqa     = benchmark_decoder("minicpm4 (After PR6923 NoPool)", 1024, 32, seqlen, opt, "minicpm4_decoder.ncnn.param", false);
-    BenchResult mcpm_pool    = benchmark_decoder("minicpm4 (After PR6923 + MemPool)", 1024, 32, seqlen, opt, "minicpm4_decoder.ncnn.param", true);
+    struct ModelSpec { const char* name; const char* label; };
+    const ModelSpec specs[] = {
+        { "qwen3_0.6b", "bf16" },
+        { "qwen3_0.6b_int8", "int8" },
+    };
 
-    fprintf(stderr, "\n--- 2. Decoder Subgraph Benchmark (qwen3_0.6b) ---\n");
-    bool has_qwen_old = std::filesystem::exists("../qwen3_0.6b/qwen3_decoder_old.ncnn.param");
-    BenchResult qwen_before  = has_qwen_old ? benchmark_decoder("qwen3 (Before PR6923)", 1024, 64, seqlen, opt, "../qwen3_0.6b/qwen3_decoder_old.ncnn.param", false) : BenchResult{};
-    BenchResult qwen_gqa     = benchmark_decoder("qwen3 (After PR6923 NoPool)", 1024, 64, seqlen, opt, "../qwen3_0.6b/qwen3_decoder.ncnn.param", false);
-    BenchResult qwen_pool    = benchmark_decoder("qwen3 (After PR6923 + MemPool)", 1024, 64, seqlen, opt, "../qwen3_0.6b/qwen3_decoder.ncnn.param", true);
+    std::vector<ModelResult> results;
 
-    fprintf(stderr, "\n--- 3. End-to-End Real Model Generation (qwen3_0.6b) ---\n");
-    E2EResult e2e_before = {0, 0, 0, 0, 0};
-    if (has_qwen_old)
+    for (const ModelSpec& spec : specs)
     {
-        fprintf(stderr, "Running baseline generation (Before PR 6923)...\n");
-        e2e_before = benchmark_e2e_qwen3_single(num_threads, "qwen3_decoder_old.ncnn.param");
-        fprintf(stderr, "Before: Prefill = %.2f ms | Decode = %.2f ms (%d tokens, %.2f tokens/s, %.2f ms/token)\n",
-                e2e_before.prefill_ms, e2e_before.decode_ms, e2e_before.token_count, e2e_before.decode_tps, e2e_before.ms_per_token);
+        ModelResult res;
+        res.name = spec.name;
+        res.label = spec.label;
+        res.tg_tokens = tg_tokens;
+
+        std::string dir = resolve_model_dir(spec.name);
+        if (dir.empty())
+        {
+            fprintf(stderr, "--- %s (%s) ---\n  SKIP: model dir not found\n\n", spec.name, spec.label);
+            results.push_back(res);
+            continue;
+        }
+        res.dir = dir;
+
+        fprintf(stderr, "--- %s (%s) ---\n  model dir: %s\n", spec.name, spec.label, dir.c_str());
+
+        // Build the exact pp-token prompt.
+        int prompt_tokens = 0;
+        std::string prompt;
+        {
+            std::unique_ptr<BpeTokenizer> tok = load_tokenizer(dir);
+            prompt = build_prompt_of_tokens(*tok, pp_tokens, prompt_tokens);
+        }
+        res.pp_tokens = prompt_tokens;
+        fprintf(stderr, "  prompt: \"%s...\" (%d tokens%s)\n",
+                one_line(prompt, 48).c_str(), prompt_tokens,
+                prompt_tokens == pp_tokens ? ", exact" : ", WARN: not exact");
+
+        // use_bf16 = true matches the default runtime config (llm_ncnn_run);
+        // the int8 model's block-quantized weights are dispatched by the param anyway.
+        ncnn_llm_gpt model(dir, use_vulkan, num_threads, use_vulkan ? gpu_device : 0, true);
+
+        // warmup pass (untimed)
+        run_pass(model, prompt, prompt_tokens, tg_tokens);
+
+        double pp_sum = 0;
+        int tg_sum = 0;
+        double tg_ms_sum = 0;
+        for (int i = 0; i < loop_count; i++)
+        {
+            if (cooling_down)
+                ncnn::sleep(10 * 1000);
+
+            PassResult pr = run_pass(model, prompt, prompt_tokens, tg_tokens);
+
+            res.pp_min = std::min(res.pp_min, pr.prefill_ms);
+            pp_sum += pr.prefill_ms;
+            res.tg_actual += pr.decode_tokens;
+            tg_sum += pr.decode_tokens;
+            tg_ms_sum += pr.decode_ms;
+
+            if (pr.decode_tokens > 0)
+                res.tg_ms_min = std::min(res.tg_ms_min, pr.decode_ms / pr.decode_tokens);
+
+            if (i == 0)
+                res.sample_text = pr.text;
+
+            fprintf(stderr, "  pass %d: pp = %7.2f ms   tg = %7.2f ms (%d/%d tok, %6.2f ms/tok)\n",
+                    i + 1, pr.prefill_ms, pr.decode_ms, pr.decode_tokens, tg_tokens,
+                    pr.decode_tokens > 0 ? pr.decode_ms / pr.decode_tokens : 0.0);
+
+            if (pr.decode_tokens < tg_tokens)
+                fprintf(stderr, "  WARN: decode stopped early (EOS after %d tokens)\n", pr.decode_tokens);
+        }
+
+        res.pp_avg = pp_sum / loop_count;
+        res.pp_tps = pp_sum > 0 ? (double)prompt_tokens * loop_count * 1000.0 / pp_sum : 0;
+        res.tg_ms_avg = tg_sum > 0 ? tg_ms_sum / tg_sum : 0;
+        res.tg_tps = tg_ms_sum > 0 ? tg_sum * 1000.0 / tg_ms_sum : 0;
+        res.ran = true;
+
+        fprintf(stderr, "  SUMMARY pp%d: min = %7.2f ms  avg = %7.2f ms  (%.1f tokens/s)\n",
+                pp_tokens, res.pp_min, res.pp_avg, res.pp_tps);
+        fprintf(stderr, "  SUMMARY tg%d: min = %6.2f ms/tok  avg = %6.2f ms/tok  (%.1f tokens/s)\n",
+                tg_tokens, res.tg_ms_min, res.tg_ms_avg, res.tg_tps);
+        fprintf(stderr, "  sample: \"%s\"\n\n", one_line(res.sample_text, 72).c_str());
+
+        results.push_back(res);
     }
 
-    fprintf(stderr, "Running optimized generation (After PR 6923 + KVCache MemPool)...\n");
-    E2EResult e2e_after = benchmark_e2e_qwen3_single(num_threads, "qwen3_decoder.ncnn.param");
-    fprintf(stderr, "After:  Prefill = %.2f ms | Decode = %.2f ms (%d tokens, %.2f tokens/s, %.2f ms/token)\n",
-            e2e_after.prefill_ms, e2e_after.decode_ms, e2e_after.token_count, e2e_after.decode_tps, e2e_after.ms_per_token);
-
-    fprintf(stderr, "\n========================================================================\n");
-    fprintf(stderr, "                      SPEED COMPARISON SUMMARY                          \n");
+    // summary table
     fprintf(stderr, "========================================================================\n");
-    fprintf(stderr, "%-32s | %-13s | %-13s | %-9s\n", "Metric", "Before PR6923", "Optimized", "Speedup");
-    fprintf(stderr, "---------------------------------+---------------+---------------+----------\n");
-    if (has_mcpm_old)
+    fprintf(stderr, "                            SPEED SUMMARY                               \n");
+    fprintf(stderr, "========================================================================\n");
+    fprintf(stderr, "%-22s | %10s | %10s | %12s | %12s\n",
+            "Model", "pp min ms", "pp avg ms", "tg ms/tok avg", "tg tokens/s");
+    fprintf(stderr, "-----------------------+------------+------------+---------------+-------------\n");
+    for (const ModelResult& r : results)
     {
-        fprintf(stderr, "%-32s | %9.2f ms   | %9.2f ms   | %+6.1f%%\n", "minicpm4 Prefill (min)", mcpm_before.prefill_min, mcpm_pool.prefill_min, (mcpm_before.prefill_min - mcpm_pool.prefill_min) / mcpm_before.prefill_min * 100.0);
-        fprintf(stderr, "%-32s | %9.2f ms   | %9.2f ms   | %+6.1f%%\n", "minicpm4 Decode (min)", mcpm_before.decode_min, mcpm_pool.decode_min, (mcpm_before.decode_min - mcpm_pool.decode_min) / mcpm_before.decode_min * 100.0);
+        if (!r.ran)
+        {
+            fprintf(stderr, "%-22s | %10s | %10s | %12s | %12s\n",
+                    (r.name + " (" + r.label + ")").c_str(), "-", "-", "-", "-");
+            continue;
+        }
+        fprintf(stderr, "%-22s | %10.2f | %10.2f | %12.2f | %12.1f\n",
+                (r.name + " (" + r.label + ")").c_str(),
+                r.pp_min, r.pp_avg, r.tg_ms_avg, r.tg_tps);
     }
-    if (has_qwen_old)
+
+    const ModelResult* bf16 = nullptr;
+    const ModelResult* int8 = nullptr;
+    for (const ModelResult& r : results)
     {
-        fprintf(stderr, "%-32s | %9.2f ms   | %9.2f ms   | %+6.1f%%\n", "qwen3 Prefill (min)", qwen_before.prefill_min, qwen_pool.prefill_min, (qwen_before.prefill_min - qwen_pool.prefill_min) / qwen_before.prefill_min * 100.0);
-        fprintf(stderr, "%-32s | %9.2f ms   | %9.2f ms   | %+6.1f%%\n", "qwen3 Decode (NoPool -> Pool)", qwen_gqa.decode_min, qwen_pool.decode_min, (qwen_gqa.decode_min - qwen_pool.decode_min) / qwen_gqa.decode_min * 100.0);
-        fprintf(stderr, "%-32s | %9.2f ms   | %9.2f ms   | %+6.1f%%\n", "qwen3 Decode Overall (min)", qwen_before.decode_min, qwen_pool.decode_min, (qwen_before.decode_min - qwen_pool.decode_min) / qwen_before.decode_min * 100.0);
-        fprintf(stderr, "%-32s | %9.2f ms   | %9.2f ms   | %+6.1f%%\n", "qwen3 E2E Prefill", e2e_before.prefill_ms, e2e_after.prefill_ms, (e2e_before.prefill_ms - e2e_after.prefill_ms) / e2e_before.prefill_ms * 100.0);
-        fprintf(stderr, "%-32s | %9.2f ms   | %9.2f ms   | %+6.1f%%\n", "qwen3 E2E Decode/Token", e2e_before.ms_per_token, e2e_after.ms_per_token, (e2e_before.ms_per_token - e2e_after.ms_per_token) / e2e_before.ms_per_token * 100.0);
-        fprintf(stderr, "%-32s | %9.2f tps  | %9.2f tps  | %+6.1f%%\n", "qwen3 E2E Decode Speed", e2e_before.decode_tps, e2e_after.decode_tps, (e2e_after.decode_tps - e2e_before.decode_tps) / e2e_before.decode_tps * 100.0);
+        if (r.label == "bf16" && r.ran) bf16 = &r;
+        if (r.label == "int8" && r.ran) int8 = &r;
+    }
+    if (bf16 && int8 && bf16->pp_avg > 0 && int8->pp_avg > 0 && bf16->tg_ms_avg > 0 && int8->tg_ms_avg > 0)
+    {
+        fprintf(stderr, "-----------------------+------------+------------+---------------+-------------\n");
+        fprintf(stderr, " int8 vs bf16          | %9.1f%% | %9.1f%% | %11.1f%% | %11.1f%%\n",
+                (bf16->pp_min - int8->pp_min) / bf16->pp_min * 100.0,
+                (bf16->pp_avg - int8->pp_avg) / bf16->pp_avg * 100.0,
+                (bf16->tg_ms_avg - int8->tg_ms_avg) / bf16->tg_ms_avg * 100.0,
+                (int8->tg_tps - bf16->tg_tps) / bf16->tg_tps * 100.0);
+        fprintf(stderr, " (positive = int8 faster)\n");
     }
     fprintf(stderr, "========================================================================\n");
 

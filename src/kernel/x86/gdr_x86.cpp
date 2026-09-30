@@ -151,7 +151,6 @@ static int torch_recurrent_gated_delta_rule(
     const float* q_ptr = query;
     const float* k_ptr = key;
 
-    int qk_size = batch_size * num_heads * seq_len * k_head_dim;
     if (use_qk_l2norm_in_kernel)
     {
         query_norm.create(k_head_dim, seq_len, num_heads * batch_size, 4u, opt.workspace_allocator);
@@ -443,6 +442,9 @@ static int torch_recurrent_gated_delta_rule(
 
 int GatedDeltaRule_x86::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    if (bottom_blobs.size() < 7 || top_blobs.empty())
+        return -100;
+
     const Mat& A_log = bottom_blobs[0];
     const Mat& dt_bias = bottom_blobs[1];
     const Mat& b = bottom_blobs[2];
@@ -452,15 +454,31 @@ int GatedDeltaRule_x86::forward(const std::vector<Mat>& bottom_blobs, std::vecto
     const Mat& value = bottom_blobs[6];
     const Mat& initial_state = bottom_blobs.size() > 7 ? bottom_blobs[7] : Mat();
 
-    int num_heads = query.h;
+    int query_heads = query.h;
+    int num_heads = value.h;
     int seq_len = query.c;
     int k_head_dim = query.w;
     int v_head_dim = value.w;
 
+    if (query_heads <= 0 || num_heads <= 0 || num_heads % query_heads != 0 ||
+        seq_len <= 0 || k_head_dim <= 0 || v_head_dim <= 0 ||
+        query.dims != 3 || key.dims != 3 || value.dims != 3 ||
+        b.dims != 2 || a.dims != 2 || A_log.dims != 1 || dt_bias.dims != 1 ||
+        key.w != k_head_dim || key.h != query_heads || key.c != seq_len ||
+        value.c != seq_len || b.w != num_heads || b.h != seq_len ||
+        a.w != num_heads || a.h != seq_len || A_log.w < num_heads ||
+        dt_bias.w < num_heads)
+        return -100;
+
+    if (!initial_state.empty() &&
+        (initial_state.dims != 3 || initial_state.w != v_head_dim ||
+         initial_state.h != k_head_dim || initial_state.c != num_heads))
+        return -100;
+
     bool use_qk_l2norm_in_kernel = true;
 
     Mat& top_blob = top_blobs[0];
-    top_blob.create(k_head_dim, num_heads, seq_len, 4u, opt.blob_allocator);
+    top_blob.create(v_head_dim, num_heads, seq_len, 4u, opt.blob_allocator);
     if (top_blob.empty())
         return -100;
 
@@ -491,7 +509,7 @@ int GatedDeltaRule_x86::forward(const std::vector<Mat>& bottom_blobs, std::vecto
     float* key_t_data = (float*)key_t.data;
     float* value_t_data = (float*)value_t.data;
 
-    if (seq_len == 1)
+    if (seq_len == 1 && query_heads == num_heads)
     {
         memcpy(query_t_data, query_data, num_heads * k_head_dim * sizeof(float));
         memcpy(key_t_data, key_data, num_heads * k_head_dim * sizeof(float));
@@ -499,11 +517,14 @@ int GatedDeltaRule_x86::forward(const std::vector<Mat>& bottom_blobs, std::vecto
     }
     else
     {
+        const int repeat = query_heads > 0 && num_heads % query_heads == 0
+            ? num_heads / query_heads : 1;
         for (int t = 0; t < seq_len; t++)
         {
             for (int h = 0; h < num_heads; h++)
             {
-                int src_k = (t * num_heads + h) * k_head_dim;
+                const int source_head = query_heads == num_heads ? h : h / repeat;
+                int src_k = (t * query_heads + source_head) * k_head_dim;
                 int dst_k = (h * seq_len + t) * k_head_dim;
                 memcpy(query_t_data + dst_k, query_data + src_k, k_head_dim * sizeof(float));
                 memcpy(key_t_data + dst_k, key_data + src_k, k_head_dim * sizeof(float));

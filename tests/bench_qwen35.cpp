@@ -21,13 +21,8 @@ struct BenchStats {
 BenchStats run_inference(const std::string& model_path, int threads, bool force_naive, int max_new_tokens = 32) {
     BenchStats stats;
 
-    // Load model with specified custom layer dispatch
-    // Note: register_gdr_layers is called in ncnn_llm_gpt constructor
-    // Set global force_naive flag before loading model
-    ncnn::Net dummy;
-    register_gdr_layers(dummy, force_naive);
-
-    ncnn_llm_gpt model(model_path, false, threads, 0, false);
+    // Keep the requested custom-layer dispatch for the model's decoder net.
+    ncnn_llm_gpt model(model_path, false, threads, 0, false, force_naive);
 
     std::string prompt = "<|im_start|>user\n请用一句话简短介绍人工智能。<|im_end|>\n<|im_start|>assistant\n";
 
