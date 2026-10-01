@@ -154,15 +154,6 @@ void gemv_bf16_fp32_x86(const float* x, const unsigned short* weight, float* log
                 __m256 vx2 = _mm256_loadu_ps(x + k + 16);
                 __m256 vx3 = _mm256_loadu_ps(x + k + 24);
 
-                _mm_prefetch((const char*)(w0 + k + 64), _MM_HINT_T0);
-                _mm_prefetch((const char*)(w1 + k + 64), _MM_HINT_T0);
-                _mm_prefetch((const char*)(w2 + k + 64), _MM_HINT_T0);
-                _mm_prefetch((const char*)(w3 + k + 64), _MM_HINT_T0);
-                _mm_prefetch((const char*)(w4 + k + 64), _MM_HINT_T0);
-                _mm_prefetch((const char*)(w5 + k + 64), _MM_HINT_T0);
-                _mm_prefetch((const char*)(w6 + k + 64), _MM_HINT_T0);
-                _mm_prefetch((const char*)(w7 + k + 64), _MM_HINT_T0);
-
                 acc0 = _mm256_fmadd_ps(vx0, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w0 + k))), acc0);
                 acc0 = _mm256_fmadd_ps(vx1, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w0 + k + 8))), acc0);
                 acc0 = _mm256_fmadd_ps(vx2, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w0 + k + 16))), acc0);
