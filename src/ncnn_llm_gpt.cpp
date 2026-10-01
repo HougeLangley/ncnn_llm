@@ -113,14 +113,7 @@ static void require_extract(int ret, const ncnn::Mat& output, const std::string&
     }
 }
 
-static int take_last_token(std::vector<int>& token_ids) {
-    if (token_ids.empty()) {
-        throw std::runtime_error("input text produced no tokens");
-    }
-    const int last_token_id = token_ids.back();
-    token_ids.pop_back();
-    return last_token_id;
-}
+
 
 // Class Implementation
 
@@ -462,7 +455,9 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     }
 
     const int total_prompt_tokens = (int)token_ids.size();
-    const int last_token_id = take_last_token(token_ids);
+    if (token_ids.empty()) {
+        throw std::runtime_error("input text produced no tokens");
+    }
 
     ncnn::Mat cos_cache, sin_cache;
     {
@@ -549,107 +544,13 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             require_extract(ret, cache, name_out);
             gdr_cache.emplace_back(std::move(cache));
         }
-    }
-
-    // Handle last token
-    ncnn::Mat last_token_mat = ncnn::Mat(1, 1, (void*)&last_token_id).clone();
-    ncnn::Mat last_token_embed;
-    {
-        ncnn_llm::ScopedTimer t(pperf.last_token_embed);
-        ncnn::Extractor ex = embed_net->create_extractor();
-        ex.input("in0", last_token_mat);
-        require_extract(ex.extract("out0", last_token_embed), last_token_embed, "embed/out0");
-    }
-    
-    ncnn::Mat last_cos_cache, last_sin_cache;
-    {
-        ncnn_llm::ScopedTimer t(pperf.last_token_rope);
-        if (rope_type == RoPE_Type::LongRoPE) {
-            generate_rope_embed_cache_LongRoPE(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, short_factor.data(), long_factor.data(), original_max_position_embeddings);
-        } else if (rope_type == RoPE_Type::NTK_RoPE) {
-            generate_ntk_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
-        } else if (rope_type == RoPE_Type::YARN_RoPE) {
-            generate_yarn_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
-        }
-        else {
-            generate_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta);
-        }
-    }
-
-    ncnn::Mat last_mask((int)token_ids.size() + 1, 1);
-    last_mask.fill(0.0f);
-
-    {
-        ncnn_llm::ScopedTimer t(pperf.last_token_decoder);
-        ncnn::Extractor ex = decoder_net->create_extractor();
-        if (kv_alloc) {
-            ex.set_kvcache_allocator(kv_alloc);
-            ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
-        }
-        ex.input("in0", last_token_embed);
-        ex.input("in1", last_mask);
-        ex.input("in2", last_cos_cache);
-        ex.input("in3", last_sin_cache);
-
-        for (int i = 0; i < attn_cnt; i++) {
-            char name_k_in[16], name_v_in[16];
-            std::snprintf(name_k_in, sizeof(name_k_in), "cache_k%d", i);
-            std::snprintf(name_v_in, sizeof(name_v_in), "cache_v%d", i);
-            ex.input(name_k_in, kv_cache[i].first);
-            ex.input(name_v_in, kv_cache[i].second);
-            kv_cache[i].first.release();
-            kv_cache[i].second.release();
-        }
-
-        for (int i = 0; i < sconv_cnt; i++) {
-            char name_in[16];
-            std::snprintf(name_in, sizeof(name_in), "cache_conv%d", i);
-            ex.input(name_in, sconv_cache[i]);
-        }
-
-        for (int i = 0; i < gdr_cnt; i++) {
-            char name_in[16];
-            std::snprintf(name_in, sizeof(name_in), "cache_gdr%d", i);
-            ex.input(name_in, gdr_cache[i]);
-        }
-
-        for (int i = 0; i < attn_cnt; i++) {
-            char name_k_out[32], name_v_out[32];
-            std::snprintf(name_k_out, sizeof(name_k_out), "out_cache_k%d", i);
-            std::snprintf(name_v_out, sizeof(name_v_out), "out_cache_v%d", i);
-            ncnn::Mat k_cache, v_cache;
-            const int k_ret = ex.extract(name_k_out, k_cache, 1);
-            const int v_ret = ex.extract(name_v_out, v_cache, 1);
-            require_extract(k_ret, k_cache, name_k_out);
-            require_extract(v_ret, v_cache, name_v_out);
-            kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
-        }
-
-        for (int i = 0; i < sconv_cnt; i++) {
-            char name_out[32];
-            std::snprintf(name_out, sizeof(name_out), "out_cache_conv%d", i);
-            ncnn::Mat cache;
-            const int ret = ex.extract(name_out, cache);
-            require_extract(ret, cache, name_out);
-            sconv_cache[i] = std::move(cache);
-        }
-
-        for (int i = 0; i < gdr_cnt; i++) {
-            char name_out[32];
-            std::snprintf(name_out, sizeof(name_out), "out_cache_gdr%d", i);
-            ncnn::Mat cache;
-            const int ret = ex.extract(name_out, cache);
-            require_extract(ret, cache, name_out);
-            gdr_cache[i] = std::move(cache);
-        }
-
         require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
     }
-
         ncnn::Mat logits;
     {
         ncnn_llm::ScopedTimer t(pperf.lm_head);
-        logits = lm_head->forward(decode_out, embed_net->opt);
+        ncnn::Mat last_hidden = decode_out.row_range(total_prompt_tokens - 1, 1).clone();
+        logits = lm_head->forward(last_hidden, embed_net->opt);
     }
 
     int next_token_id = 0;
@@ -667,7 +568,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
 
     ctx->kv_cache = std::move(kv_cache);
     ctx->cur_token = next_token_id;
-    ctx->position_id = (int)token_ids.size() + 1;
+    ctx->position_id = total_prompt_tokens;
     
     if (sconv_cnt > 0 || gdr_cnt > 0) {
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(ctx);
@@ -717,7 +618,9 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         token_ids = bpe->encode(input_text, false, false);
     }
     const int total_prompt_tokens = (int)token_ids.size();
-    const int last_token_id = take_last_token(token_ids);
+    if (token_ids.empty()) {
+        throw std::runtime_error("input text produced no tokens");
+    }
 
     ncnn::Mat input_ids_mat = ncnn::Mat((int)token_ids.size(), 1, (void*)token_ids.data()).clone();
     ncnn::Mat token_embed;
@@ -820,93 +723,13 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
                 qwen_ctx->gdr_cache[i] = std::move(cache);
             }
         }
-    }
-
-    ncnn::Mat last_token_mat = ncnn::Mat(1, 1, (void*)&last_token_id).clone();
-    ncnn::Mat last_token_embed;
-    {
-        ncnn_llm::ScopedTimer t(pperf.last_token_embed);
-        ncnn::Extractor ex = embed_net->create_extractor();
-        ex.input("in0", last_token_mat);
-        require_extract(ex.extract("out0", last_token_embed), last_token_embed, "embed/out0");
-    }
-    
-    ncnn::Mat last_cos_cache, last_sin_cache;
-    generate_rope_embed_cache(1, rope_head_dim, new_ctx->position_id, last_cos_cache, last_sin_cache, rope_theta);
-    new_ctx->position_id += 1;
-
-    ncnn::Mat last_mask(new_ctx->kv_cache[0].first.h + 1, 1);
-    last_mask.fill(0.0f);
-
-    {
-        ncnn::Extractor ex = decoder_net->create_extractor();
-        if (kv_alloc) {
-            ex.set_kvcache_allocator(kv_alloc);
-            ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
-        }
-        ex.input("in0", last_token_embed);
-        ex.input("in1", last_mask);
-        ex.input("in2", last_cos_cache);
-        ex.input("in3", last_sin_cache);
-
-        for (int i = 0; i < attn_cnt; i++) {
-            char kname[16], vname[16];
-            std::snprintf(kname, sizeof(kname), "cache_k%d", i);
-            std::snprintf(vname, sizeof(vname), "cache_v%d", i);
-            ex.input(kname, new_ctx->kv_cache[i].first);
-            ex.input(vname, new_ctx->kv_cache[i].second);
-            new_ctx->kv_cache[i].first.release();
-            new_ctx->kv_cache[i].second.release();
-        }
-
-        auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
-        if (qwen_ctx) {
-            for (int i = 0; i < sconv_cnt; ++i) {
-                char name[16];
-                std::snprintf(name, sizeof(name), "cache_conv%d", i);
-                ex.input(name, qwen_ctx->sconv_cache[i]);
-            }
-            for (int i = 0; i < gdr_cnt; ++i) {
-                char name[16];
-                std::snprintf(name, sizeof(name), "cache_gdr%d", i);
-                ex.input(name, qwen_ctx->gdr_cache[i]);
-            }
-        }
-
-        for (int i = 0; i < attn_cnt; i++) {
-            char kname[32], vname[32];
-            std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
-            std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
-            ncnn::Mat k_cache, v_cache;
-            require_extract(ex.extract(kname, k_cache, 1), k_cache, kname);
-            require_extract(ex.extract(vname, v_cache, 1), v_cache, vname);
-            new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
-        }
-
-        if (qwen_ctx) {
-            for (int i = 0; i < sconv_cnt; ++i) {
-                char name[32];
-                std::snprintf(name, sizeof(name), "out_cache_conv%d", i);
-                ncnn::Mat cache;
-                require_extract(ex.extract(name, cache), cache, name);
-                qwen_ctx->sconv_cache[i] = std::move(cache);
-            }
-            for (int i = 0; i < gdr_cnt; ++i) {
-                char name[32];
-                std::snprintf(name, sizeof(name), "out_cache_gdr%d", i);
-                ncnn::Mat cache;
-                require_extract(ex.extract(name, cache), cache, name);
-                qwen_ctx->gdr_cache[i] = std::move(cache);
-            }
-        }
-
         require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
     }
-
         ncnn::Mat logits;
     {
         ncnn_llm::ScopedTimer t(pperf.lm_head);
-        logits = lm_head->forward(decode_out, embed_net->opt);
+        ncnn::Mat last_hidden = decode_out.row_range(total_prompt_tokens - 1, 1).clone();
+        logits = lm_head->forward(last_hidden, embed_net->opt);
     }
     
     int next_token_id = 0;
@@ -940,7 +763,9 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         token_ids = bpe->encode(input_text, false, false);
     }
     const int total_prompt_tokens = (int)token_ids.size();
-    const int last_token_id = take_last_token(token_ids);
+    if (token_ids.empty()) {
+        throw std::runtime_error("input text produced no tokens");
+    }
 
     ncnn::Mat cos_cache, sin_cache;
     int current_pos = new_ctx->position_id;
@@ -1038,103 +863,13 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
                 qwen_ctx->gdr_cache[i] = std::move(cache);
             }
         }
-    }
-
-    ncnn::Mat last_token_mat = ncnn::Mat(1, 1, (void*)&last_token_id).clone();
-    ncnn::Mat last_token_embed;
-    {
-        ncnn_llm::ScopedTimer t(pperf.last_token_embed);
-        ncnn::Extractor ex = embed_net->create_extractor();
-        ex.input("in0", last_token_mat);
-        require_extract(ex.extract("out0", last_token_embed), last_token_embed, "embed/out0");
-    }
-    
-    ncnn::Mat last_cos_cache, last_sin_cache;
-
-    if (rope_type == RoPE_Type::LongRoPE) {
-        generate_rope_embed_cache_LongRoPE(1, rope_head_dim, new_ctx->position_id, last_cos_cache, last_sin_cache, rope_theta, short_factor.data(), long_factor.data(), original_max_position_embeddings);
-    } else if (rope_type == RoPE_Type::NTK_RoPE) {
-        generate_ntk_rope_embed_cache(1, rope_head_dim, new_ctx->position_id, last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
-    } else if (rope_type == RoPE_Type::YARN_RoPE) {
-        generate_yarn_rope_embed_cache(1, rope_head_dim, new_ctx->position_id, last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
-    }
-    else {
-        generate_rope_embed_cache(1, rope_head_dim, new_ctx->position_id, last_cos_cache, last_sin_cache, rope_theta);
-    }
-    new_ctx->position_id += 1;
-    
-    ncnn::Mat last_mask(new_ctx->kv_cache[0].first.h + 1, 1);
-    last_mask.fill(0.0f);
-
-    {
-        ncnn::Extractor ex = decoder_net->create_extractor();
-        if (kv_alloc) {
-            ex.set_kvcache_allocator(kv_alloc);
-            ex.set_kvcache_max_seqlen_hint(max_seqlen_hint);
-        }
-        ex.input("in0", last_token_embed);
-        ex.input("in1", last_mask);
-        ex.input("in2", last_cos_cache);
-        ex.input("in3", last_sin_cache);
-
-        for (int i = 0; i < attn_cnt; i++) {
-            char kname[16], vname[16];
-            std::snprintf(kname, sizeof(kname), "cache_k%d", i);
-            std::snprintf(vname, sizeof(vname), "cache_v%d", i);
-            ex.input(kname, new_ctx->kv_cache[i].first);
-            ex.input(vname, new_ctx->kv_cache[i].second);
-            new_ctx->kv_cache[i].first.release();
-            new_ctx->kv_cache[i].second.release();
-        }
-
-        auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
-        if (qwen_ctx) {
-            for (int i = 0; i < sconv_cnt; ++i) {
-                char name[16];
-                std::snprintf(name, sizeof(name), "cache_conv%d", i);
-                ex.input(name, qwen_ctx->sconv_cache[i]);
-            }
-            for (int i = 0; i < gdr_cnt; ++i) {
-                char name[16];
-                std::snprintf(name, sizeof(name), "cache_gdr%d", i);
-                ex.input(name, qwen_ctx->gdr_cache[i]);
-            }
-        }
-
-        for (int i = 0; i < attn_cnt; i++) {
-            char kname[32], vname[32];
-            std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
-            std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
-            ncnn::Mat k_cache, v_cache;
-            require_extract(ex.extract(kname, k_cache, 1), k_cache, kname);
-            require_extract(ex.extract(vname, v_cache, 1), v_cache, vname);
-            new_ctx->kv_cache[i] = std::make_pair(std::move(k_cache), std::move(v_cache));
-        }
-
-        if (qwen_ctx) {
-            for (int i = 0; i < sconv_cnt; ++i) {
-                char name[32];
-                std::snprintf(name, sizeof(name), "out_cache_conv%d", i);
-                ncnn::Mat cache;
-                require_extract(ex.extract(name, cache), cache, name);
-                qwen_ctx->sconv_cache[i] = std::move(cache);
-            }
-            for (int i = 0; i < gdr_cnt; ++i) {
-                char name[32];
-                std::snprintf(name, sizeof(name), "out_cache_gdr%d", i);
-                ncnn::Mat cache;
-                require_extract(ex.extract(name, cache), cache, name);
-                qwen_ctx->gdr_cache[i] = std::move(cache);
-            }
-        }
-
         require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
     }
-
         ncnn::Mat logits;
     {
         ncnn_llm::ScopedTimer t(pperf.lm_head);
-        logits = lm_head->forward(decode_out, embed_net->opt);
+        ncnn::Mat last_hidden = decode_out.row_range(total_prompt_tokens - 1, 1).clone();
+        logits = lm_head->forward(last_hidden, embed_net->opt);
     }
     
     int next_token_id = 0;
