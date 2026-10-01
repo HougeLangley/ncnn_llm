@@ -109,7 +109,8 @@ int llm_select_next_token(const ncnn::Mat& logits,
     if (vocab_size <= 0) {
         return 0;
     }
-    std::vector<float> scores(vocab_size);
+    thread_local std::vector<float> scores;
+    scores.resize(vocab_size);
     std::memcpy(scores.data(), logits.data, sizeof(float) * vocab_size);
 
     for (const auto& kv : history_counts) {

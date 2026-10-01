@@ -129,10 +129,9 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
         model_path_ = model_path;
         use_vulkan_ = use_vulkan;
         {
-            int default_threads = ncnn::get_physical_big_cpu_count();
-            if (default_threads <= 0) default_threads = ncnn::get_physical_cpu_count();
+            int default_threads = ncnn::get_physical_cpu_count();
             if (default_threads <= 0) default_threads = ncnn::get_cpu_count();
-            default_threads = std::clamp(default_threads, 1, 8);
+            if (default_threads <= 0) default_threads = 4;
             num_threads_ = num_threads > 0 ? num_threads : default_threads;
         }
         vulkan_device_ = vulkan_device;
@@ -549,7 +548,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         ncnn::Mat logits;
     {
         ncnn_llm::ScopedTimer t(pperf.lm_head);
-        ncnn::Mat last_hidden = decode_out.row_range(total_prompt_tokens - 1, 1).clone();
+        ncnn::Mat last_hidden = decode_out.row_range(total_prompt_tokens - 1, 1);
         logits = lm_head->forward(last_hidden, embed_net->opt);
     }
 
@@ -728,7 +727,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         ncnn::Mat logits;
     {
         ncnn_llm::ScopedTimer t(pperf.lm_head);
-        ncnn::Mat last_hidden = decode_out.row_range(total_prompt_tokens - 1, 1).clone();
+        ncnn::Mat last_hidden = decode_out.row_range(total_prompt_tokens - 1, 1);
         logits = lm_head->forward(last_hidden, embed_net->opt);
     }
     
@@ -868,7 +867,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         ncnn::Mat logits;
     {
         ncnn_llm::ScopedTimer t(pperf.lm_head);
-        ncnn::Mat last_hidden = decode_out.row_range(total_prompt_tokens - 1, 1).clone();
+        ncnn::Mat last_hidden = decode_out.row_range(total_prompt_tokens - 1, 1);
         logits = lm_head->forward(last_hidden, embed_net->opt);
     }
     
