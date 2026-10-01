@@ -37,7 +37,7 @@ void gemv_fp32_x86(const float* x, const float* weight, float* logits,
         num_threads = omp_get_max_threads();
     }
 
-    #pragma omp parallel for num_threads(num_threads) schedule(guided)
+    #pragma omp parallel for num_threads(num_threads) schedule(static)
     for (int i = 0; i < N; i += 8) {
         if (i + 7 < N) {
             const float* w0 = weight + (size_t)(i + 0) * K;
@@ -126,7 +126,7 @@ void gemv_bf16_fp32_x86(const float* x, const unsigned short* weight, float* log
         num_threads = omp_get_max_threads();
     }
 
-    #pragma omp parallel for num_threads(num_threads) schedule(guided)
+    #pragma omp parallel for num_threads(num_threads) schedule(static)
     for (int i = 0; i < N; i += 8) {
         if (i + 7 < N) {
             const unsigned short* w0 = weight + (size_t)(i + 0) * K;
