@@ -8,7 +8,7 @@
 // config as ncnn_llm_gpt) and verified by an encode -> decode -> re-encode fixed
 // point check, so the token count fed into prefill is exact, not approximate.
 //
-// usage: benchllm [loop_count] [threads] [powersave] [gpu_device] [cooling_down] [pp] [tg]
+// usage: benchllm [loop_count] [threads] [powersave] [gpu_device] [cooling_down] [pp] [tg] [perf_level]
 //   Any numeric argument <= 0 (or omitted) falls back to the default.
 //   loop_count    measured passes per model (default 4)
 //   threads       cpu threads (default 4)
@@ -17,6 +17,7 @@
 //   cooling_down  1 = sleep between passes (default 0)
 //   pp            prefill token count (default 256)
 //   tg            decode token count (default 64)
+//   perf_level    0 = off, 1 = stages, 2 = stages + layers (default 0 or env NCNN_LLM_PERF)
 
 #include <float.h>
 #include <stdio.h>
@@ -35,6 +36,7 @@
 #include <cpu.h>
 
 #include "ncnn_llm_gpt.h"
+#include "utils/perf_profiler.h"
 #include "utils/tokenizer/bpe_tokenizer.h"
 
 static const char* PROMPT_SEED =
@@ -155,7 +157,7 @@ struct PassResult
     std::string text;
 };
 
-static PassResult run_pass(ncnn_llm_gpt& model, const std::string& prompt, int pp_tokens, int tg_tokens)
+static PassResult run_pass(ncnn_llm_gpt& model, const std::string& prompt, int pp_tokens, int tg_tokens, int perf_level = 0)
 {
     PassResult r = {0, pp_tokens, 0, 0, ""};
 
@@ -168,6 +170,8 @@ static PassResult run_pass(ncnn_llm_gpt& model, const std::string& prompt, int p
     cfg.temperature = 0.f;
     cfg.do_sample = 0;
     cfg.repetition_penalty = 1.f;
+    cfg.perf_level = perf_level;
+    cfg.enable_perf = (perf_level > 0);
 
     int tokens = 0;
     std::string text;
@@ -215,6 +219,11 @@ int main(int argc, char** argv)
     if (argc >= 6) cooling_down = atoi(argv[5]);
     if (argc >= 7) pp_tokens = atoi(argv[6]);
     if (argc >= 8) tg_tokens = atoi(argv[7]);
+    int perf_level = 0;
+    if (argc >= 9) perf_level = atoi(argv[8]);
+    if (perf_level <= 0) {
+        perf_level = ncnn_llm::get_perf_level();
+    }
 
     // Sanitize: never trust a non-positive value.
     if (loop_count <= 0) loop_count = 4;
@@ -279,8 +288,8 @@ int main(int argc, char** argv)
         // the int8 model's block-quantized weights are dispatched by the param anyway.
         ncnn_llm_gpt model(dir, use_vulkan, num_threads, use_vulkan ? gpu_device : 0, true);
 
-        // warmup pass (untimed)
-        run_pass(model, prompt, prompt_tokens, tg_tokens);
+        // warmup pass (untimed, disable perf)
+        run_pass(model, prompt, prompt_tokens, tg_tokens, -1);
 
         double pp_sum = 0;
         int tg_sum = 0;
@@ -290,7 +299,8 @@ int main(int argc, char** argv)
             if (cooling_down)
                 ncnn::sleep(10 * 1000);
 
-            PassResult pr = run_pass(model, prompt, prompt_tokens, tg_tokens);
+            int pass_perf = (i == 0 ? perf_level : -1);
+            PassResult pr = run_pass(model, prompt, prompt_tokens, tg_tokens, pass_perf);
 
             res.pp_min = std::min(res.pp_min, pr.prefill_ms);
             pp_sum += pr.prefill_ms;

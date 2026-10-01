@@ -27,6 +27,8 @@ void print_usage(const char* argv0) {
         << "  --do-sample                Enable stochastic sampling\n"
         << "  --no-builtin-tools         Disable built-in tools (random/add)\n"
         << "  --enable-thinking          Enable model reasoning output (<think>...</think>)\n"
+        << "  --perf                     Enable performance profiling report\n"
+        << "  --perf-level <1|2>         Profiling detail level (1: stages, 2: stages + layers)\n"
         << "  --help                     Show this help\n"
         << "\n"
         << "Examples:\n"
@@ -99,6 +101,13 @@ Options parse_options(int argc, char** argv) {
             opt.repetition_penalty = std::atof(argv[++i]);
         } else if (a == "--do-sample" || a == "--sample") {
             opt.do_sample = true;
+        } else if (a == "--perf") {
+            opt.enable_perf = true;
+            if (opt.perf_level == 0) opt.perf_level = 1;
+        } else if (a == "--perf-level") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --perf-level\n"; std::exit(2); }
+            opt.perf_level = std::atoi(argv[++i]);
+            opt.enable_perf = true;
         } else {
             std::cerr << "Unknown option: " << a << "\n";
             print_usage(argv[0]);

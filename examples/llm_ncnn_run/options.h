@@ -16,6 +16,8 @@ struct Options {
     int top_k = 40;
     float repetition_penalty = 1.1f;
     bool do_sample = false;
+    bool enable_perf = false;
+    int perf_level = 0;
 };
 
 Options parse_options(int argc, char** argv);

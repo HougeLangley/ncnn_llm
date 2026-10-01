@@ -1,4 +1,4 @@
-#include "test_framework.h"
+﻿#include "test_framework.h"
 #include "ncnn_llm_gpt.h"
 #include "utils/prompt.h"
 
@@ -303,6 +303,7 @@ bool test_model_int8_inference() {
         std::string response;
         GenerateConfig cfg;
         cfg.max_new_tokens = 16;
+        cfg.enable_thinking = true;
         ctx = model.generate(ctx, cfg, [&response](const std::string& token) {
             response += token;
         });

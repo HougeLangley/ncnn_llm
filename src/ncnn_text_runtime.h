@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <unordered_map>
 #include <unordered_set>
@@ -33,6 +33,11 @@ ncnn::Mat llm_run_decoder_with_kv(ncnn::Net& decoder_net,
                                   int max_seqlen_hint = 0);
 
 ncnn::Mat llm_run_lm_head(ncnn::Net& lm_head_net, const ncnn::Mat& hidden_states);
+namespace ncnn_llm {
+class LlmHead;
+}
+
+ncnn::Mat llm_run_lm_head(const ncnn_llm::LlmHead& lm_head, const ncnn::Mat& hidden_states, const ncnn::Option& opt);
 
 int llm_select_next_token(const ncnn::Mat& logits,
                           const std::unordered_map<int, int>& history_counts,

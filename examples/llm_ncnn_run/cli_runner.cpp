@@ -90,6 +90,8 @@ int run_cli(const Options& opt,
         cfg.repetition_penalty = opt.repetition_penalty;
         cfg.do_sample = opt.do_sample;
         cfg.enable_thinking = opt.enable_thinking;
+        cfg.enable_perf = opt.enable_perf;
+        cfg.perf_level = opt.perf_level;
 
         cfg.tool_callback = [&](const json& call) {
             json result;

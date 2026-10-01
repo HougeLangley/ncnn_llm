@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <array>
 #include <cassert>
@@ -26,6 +26,8 @@
 #include "utils/prompt.h"
 #include "kernel/gdr.h"
 #include "utils/image_utils.h"
+#include "utils/perf_profiler.h"
+#include "kernel/lm_head.h"
 
 using nlohmann::json;
 
@@ -41,6 +43,8 @@ struct GenerateConfig {
     std::function<nlohmann::json(const nlohmann::json&)> tool_callback = nullptr;
 
     bool debug = false;
+    bool enable_perf = false;
+    int perf_level = 0;
 };
 
 inline ncnn::Mat clone_kvcache_mat(const ncnn::Mat& src, ncnn::Allocator* allocator) {
@@ -69,6 +73,7 @@ public:
     KVCache kv_cache;
     int cur_token = 0;
     int position_id = 0;
+    ncnn_llm::PrefillPerfStats prefill_perf;
 };
 
 class ncnn_llm_gpt_base_ctx : public ncnn_llm_gpt_ctx {
@@ -84,6 +89,7 @@ public:
         }
         dst->cur_token = cur_token;
         dst->position_id = position_id;
+        dst->prefill_perf = prefill_perf;
         return dst;
     }
 };
@@ -118,6 +124,7 @@ public:
         }
         dst->cur_token = cur_token;
         dst->position_id = position_id;
+        dst->prefill_perf = prefill_perf;
         return dst;
     }
 };
@@ -127,6 +134,7 @@ private:
     std::shared_ptr<ncnn::Net> decoder_net;
     std::shared_ptr<ncnn::Net> embed_net;
     std::shared_ptr<ncnn::Net> proj_out_net;
+    std::shared_ptr<ncnn_llm::LlmHead> lm_head;
     std::shared_ptr<ncnn::Net> vision_embed_patch;
     std::shared_ptr<ncnn::Net> vision_embed_pos;
     std::shared_ptr<ncnn::Net> vision_encoder;
@@ -193,6 +201,17 @@ public:
     bool supports_tool_calling() const { return tool_call_id >= 0; }
     bool supports_vision() const { return vision_type != Vision_Type::VISION_CLOSE; }
     const std::string& get_model_type() const { return model_type; }
+
+    std::string model_path_;
+    bool use_vulkan_ = false;
+    int num_threads_ = 0;
+    int vulkan_device_ = 0;
+    bool use_bf16_ = true;
+    mutable ncnn_llm::LlmPerfReport last_perf_report;
+
+    const ncnn_llm::LlmPerfReport& get_last_perf_report() const { return last_perf_report; }
+    void print_last_perf_report(bool include_layer_stats = true) const;
+    std::string get_last_perf_report_str(bool include_layer_stats = true) const;
 
     template<typename T>
     static constexpr const char* json_type_name() {

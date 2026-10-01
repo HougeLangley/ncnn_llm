@@ -68,6 +68,8 @@ set(NCNN_LLM_SOURCES
     src/utils/prompt.cpp
     src/utils/rope_embed.cpp
     src/utils/vision_rope.cpp
+    src/utils/perf_profiler.cpp
+    src/kernel/lm_head.cpp
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x86|i[3-6]86" OR CMAKE_GENERATOR_PLATFORM MATCHES "x64|X64|x86|Win32" OR WIN32)

@@ -1,3 +1,7 @@
+﻿#include <cpu.h>
+#include "utils/perf_profiler.h"
+#include "kernel/lm_head.h"
+#include "embed.h"
 #include "ncnn_llm_gpt.h"
 #include "ncnn_text_runtime.h"
 #include "utils/vision_rope.h"
@@ -129,10 +133,17 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
             ifs >> config;
         }
         
+        model_path_ = model_path;
+        use_vulkan_ = use_vulkan;
+        num_threads_ = num_threads > 0 ? num_threads : ncnn::get_cpu_count();
+        vulkan_device_ = vulkan_device;
+        use_bf16_ = use_bf16;
+
         // Load base model
         decoder_net = std::make_shared<ncnn::Net>();
         embed_net = std::make_shared<ncnn::Net>();
         proj_out_net = std::make_shared<ncnn::Net>();
+        lm_head = std::make_shared<ncnn_llm::LlmHead>();
 
         // Set number of threads (0 = use ncnn default which is get_cpu_count())
         if (num_threads > 0) {
@@ -216,7 +227,42 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
                                      std::to_string(decoder_model_ret) + "): " + decoder_bin);
         }
         load_net(*embed_net, "embed", embed_param, embed_bin);
-        load_net(*proj_out_net, "proj_out", proj_out_param, proj_out_bin);
+
+        bool tied_embeddings = (embed_bin == proj_out_bin);
+        bool shared_success = false;
+
+        if (tied_embeddings) {
+            ncnn::Mat embed_weight;
+            for (const auto* layer : embed_net->layers()) {
+                if (layer && layer->type == "Embed") {
+                    const auto* el = static_cast<const ncnn::Embed*>(layer);
+                    embed_weight = el->weight_data;
+                    break;
+                }
+            }
+
+            if (!embed_weight.empty()) {
+                ncnn::Option lm_opt = embed_net->opt;
+                int ret = lm_head->init_shared(proj_out_param, embed_weight, lm_opt);
+                if (ret == 0) {
+                    shared_success = true;
+                    printf("[ncnn_llm_gpt] Shared LM head with embedding weights (skipped loading %s, saved %zu MB)\n",
+                           proj_out_bin.c_str(), (size_t)(embed_weight.total() * embed_weight.elemsize / (1024 * 1024)));
+                } else {
+                    printf("[ncnn_llm_gpt] Warning: Failed to initialize shared LM head (ret=%d), falling back to file load\n", ret);
+                }
+            }
+        }
+
+        if (!shared_success) {
+            ncnn::Option lm_opt = embed_net->opt;
+            int ret = lm_head->init_from_file(proj_out_param, proj_out_bin, lm_opt);
+            if (ret != 0) {
+                throw std::runtime_error("lm_head init_from_file failed (ret=" +
+                                         std::to_string(ret) + "): " + proj_out_param);
+            }
+        }
+        proj_out_net = lm_head->get_net();
 
         // Load tokenizer
         std::string type = "bpe";
@@ -399,42 +445,58 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
 }
 
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input_text) const {
-    auto token_ids = bpe->encode(input_text, false, false);
-    if (bos >= 0) token_ids.insert(token_ids.begin(), bos);
+    const auto t_prefill_start = std::chrono::steady_clock::now();
 
+    auto ctx = create_ctx(sconv_cnt, gdr_cnt);
+    ncnn_llm::PrefillPerfStats& pperf = ctx->prefill_perf;
+
+    std::vector<int> token_ids;
+    {
+        ncnn_llm::ScopedTimer t(pperf.tokenizer_encode);
+        token_ids = bpe->encode(input_text, false, false);
+        if (bos >= 0) token_ids.insert(token_ids.begin(), bos);
+    }
+
+    const int total_prompt_tokens = (int)token_ids.size();
     const int last_token_id = take_last_token(token_ids);
 
     ncnn::Mat cos_cache, sin_cache;
-    if (rope_type == RoPE_Type::LongRoPE) {
-        generate_rope_embed_cache_LongRoPE(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta, short_factor.data(), long_factor.data(), original_max_position_embeddings);
-    } else if (rope_type == RoPE_Type::NTK_RoPE) {
-        generate_ntk_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
-    } else if (rope_type == RoPE_Type::YARN_RoPE) {
-        generate_yarn_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
-    }
-    else
     {
-        generate_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta);
+        ncnn_llm::ScopedTimer t(pperf.rope_cache);
+        if (rope_type == RoPE_Type::LongRoPE) {
+            generate_rope_embed_cache_LongRoPE(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta, short_factor.data(), long_factor.data(), original_max_position_embeddings);
+        } else if (rope_type == RoPE_Type::NTK_RoPE) {
+            generate_ntk_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
+        } else if (rope_type == RoPE_Type::YARN_RoPE) {
+            generate_yarn_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
+        }
+        else
+        {
+            generate_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta);
+        }
     }
 
     ncnn::Mat input_ids_mat = ncnn::Mat((int)token_ids.size(), 1, (void*)token_ids.data()).clone();
     ncnn::Mat token_embed;
     {
+        ncnn_llm::ScopedTimer t(pperf.embed_lookup);
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", input_ids_mat);
         require_extract(ex.extract("out0", token_embed), token_embed, "embed/out0");
     }
 
     ncnn::Mat mask((int)token_ids.size(), (int)token_ids.size());
-    mask.fill(0.0f);
-    for (int i = 0; i < (int)token_ids.size(); i++) {
-        float* row = mask.row(i);
-        for (int j = i + 1; j < (int)token_ids.size(); j++) {
-            row[j] = -1e38f;
+    {
+        ncnn_llm::ScopedTimer t(pperf.causal_mask);
+        mask.fill(0.0f);
+        for (int i = 0; i < (int)token_ids.size(); i++) {
+            float* row = mask.row(i);
+            for (int j = i + 1; j < (int)token_ids.size(); j++) {
+                row[j] = -1e38f;
+            }
         }
     }
 
-    auto ctx = create_ctx(sconv_cnt, gdr_cnt);
     ncnn::Allocator* kv_alloc = ctx->kvcache_allocator ? ctx->kvcache_allocator.get() : nullptr;
     const int max_seqlen_hint = (int)token_ids.size() + 512;
 
@@ -443,6 +505,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     std::vector<ncnn::Mat> gdr_cache;
     ncnn::Mat decode_out;
     {
+        ncnn_llm::ScopedTimer t(pperf.decoder_prompt);
         ncnn::Extractor ex = decoder_net->create_extractor();
         if (kv_alloc) {
             ex.set_kvcache_allocator(kv_alloc);
@@ -488,27 +551,32 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     ncnn::Mat last_token_mat = ncnn::Mat(1, 1, (void*)&last_token_id).clone();
     ncnn::Mat last_token_embed;
     {
+        ncnn_llm::ScopedTimer t(pperf.last_token_embed);
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", last_token_mat);
         require_extract(ex.extract("out0", last_token_embed), last_token_embed, "embed/out0");
     }
     
     ncnn::Mat last_cos_cache, last_sin_cache;
-    if (rope_type == RoPE_Type::LongRoPE) {
-        generate_rope_embed_cache_LongRoPE(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, short_factor.data(), long_factor.data(), original_max_position_embeddings);
-    } else if (rope_type == RoPE_Type::NTK_RoPE) {
-        generate_ntk_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
-    } else if (rope_type == RoPE_Type::YARN_RoPE) {
-        generate_yarn_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
-    }
-    else {
-        generate_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta);
+    {
+        ncnn_llm::ScopedTimer t(pperf.last_token_rope);
+        if (rope_type == RoPE_Type::LongRoPE) {
+            generate_rope_embed_cache_LongRoPE(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, short_factor.data(), long_factor.data(), original_max_position_embeddings);
+        } else if (rope_type == RoPE_Type::NTK_RoPE) {
+            generate_ntk_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
+        } else if (rope_type == RoPE_Type::YARN_RoPE) {
+            generate_yarn_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
+        }
+        else {
+            generate_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta);
+        }
     }
 
     ncnn::Mat last_mask((int)token_ids.size() + 1, 1);
     last_mask.fill(0.0f);
 
     {
+        ncnn_llm::ScopedTimer t(pperf.last_token_decoder);
         ncnn::Extractor ex = decoder_net->create_extractor();
         if (kv_alloc) {
             ex.set_kvcache_allocator(kv_alloc);
@@ -574,15 +642,15 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
     }
 
-    ncnn::Mat logits;
+        ncnn::Mat logits;
     {
-        ncnn::Extractor ex = proj_out_net->create_extractor();
-        ex.input("in0", decode_out);
-        require_extract(ex.extract("out0", logits), logits, "proj_out/out0");
+        ncnn_llm::ScopedTimer t(pperf.lm_head);
+        logits = lm_head->forward(decode_out, embed_net->opt);
     }
 
     int next_token_id = 0;
     {
+        ncnn_llm::ScopedTimer t(pperf.sampling);
         const float* p = logits;
         float max_val = p[0];
         for (int i = 1; i < logits.w; ++i) {
@@ -604,7 +672,11 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
             qwen_ctx->gdr_cache = std::move(gdr_cache);
         }
     }
-    
+
+    const auto t_prefill_end = std::chrono::steady_clock::now();
+    pperf.total_ms += std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
+    pperf.prompt_tokens += total_prompt_tokens;
+
     return ctx;
 }
 
@@ -616,25 +688,37 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         throw std::runtime_error("model does not support image input");
     }
 
+    const auto t_prefill_start = std::chrono::steady_clock::now();
     std::shared_ptr<ncnn_llm_gpt_ctx> new_ctx = clone_ctx(ctx);
+    ncnn_llm::PrefillPerfStats& pperf = new_ctx->prefill_perf;
     ncnn::Allocator* kv_alloc = new_ctx->kvcache_allocator ? new_ctx->kvcache_allocator.get() : nullptr;
     const int max_seqlen_hint = new_ctx->position_id + (int)input_text.size() + 512;
 
     ncnn::Mat image_embeds;
     int num_patches_w = 0;
     int num_patches_h = 0;
-    const int vision_ret = get_visiual_features(bgr, image_embeds, num_patches_w, num_patches_h);
+    int vision_ret;
+    {
+        ncnn_llm::ScopedTimer t(pperf.vision_feature_extract);
+        vision_ret = get_visiual_features(bgr, image_embeds, num_patches_w, num_patches_h);
+    }
     if (vision_ret != 0 || image_embeds.empty()) {
         throw std::runtime_error("vision feature extraction failed");
     }
     const int image_embeds_size = image_embeds.h;
 
-    auto token_ids = bpe->encode(input_text, false, false);
+    std::vector<int> token_ids;
+    {
+        ncnn_llm::ScopedTimer t(pperf.tokenizer_encode);
+        token_ids = bpe->encode(input_text, false, false);
+    }
+    const int total_prompt_tokens = (int)token_ids.size();
     const int last_token_id = take_last_token(token_ids);
 
     ncnn::Mat input_ids_mat = ncnn::Mat((int)token_ids.size(), 1, (void*)token_ids.data()).clone();
     ncnn::Mat token_embed;
     {
+        ncnn_llm::ScopedTimer t(pperf.embed_lookup);
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", input_ids_mat);
         require_extract(ex.extract("out0", token_embed), token_embed, "embed/out0");
@@ -671,6 +755,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
 
     ncnn::Mat decode_out;
     {
+        ncnn_llm::ScopedTimer t(pperf.decoder_prompt);
         ncnn::Extractor ex = decoder_net->create_extractor();
         if (kv_alloc) {
             ex.set_kvcache_allocator(kv_alloc);
@@ -736,6 +821,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     ncnn::Mat last_token_mat = ncnn::Mat(1, 1, (void*)&last_token_id).clone();
     ncnn::Mat last_token_embed;
     {
+        ncnn_llm::ScopedTimer t(pperf.last_token_embed);
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", last_token_mat);
         require_extract(ex.extract("out0", last_token_embed), last_token_embed, "embed/out0");
@@ -813,11 +899,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
     }
 
-    ncnn::Mat logits;
+        ncnn::Mat logits;
     {
-        ncnn::Extractor ex = proj_out_net->create_extractor();
-        ex.input("in0", decode_out);
-        require_extract(ex.extract("out0", logits), logits, "proj_out/out0");
+        ncnn_llm::ScopedTimer t(pperf.lm_head);
+        logits = lm_head->forward(decode_out, embed_net->opt);
     }
     
     int next_token_id = 0;
@@ -832,15 +917,25 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         }
     }
     new_ctx->cur_token = next_token_id;
+    const auto t_prefill_end = std::chrono::steady_clock::now();
+    pperf.total_ms += std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
+    pperf.prompt_tokens += total_prompt_tokens;
     return new_ctx;
 }
 
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input_text, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const {
+    const auto t_prefill_start = std::chrono::steady_clock::now();
     std::shared_ptr<ncnn_llm_gpt_ctx> new_ctx = clone_ctx(ctx);
+    ncnn_llm::PrefillPerfStats& pperf = new_ctx->prefill_perf;
     ncnn::Allocator* kv_alloc = new_ctx->kvcache_allocator ? new_ctx->kvcache_allocator.get() : nullptr;
     const int max_seqlen_hint = new_ctx->position_id + (int)input_text.size() + 512;
 
-    auto token_ids = bpe->encode(input_text, false, false);
+    std::vector<int> token_ids;
+    {
+        ncnn_llm::ScopedTimer t(pperf.tokenizer_encode);
+        token_ids = bpe->encode(input_text, false, false);
+    }
+    const int total_prompt_tokens = (int)token_ids.size();
     const int last_token_id = take_last_token(token_ids);
 
     ncnn::Mat cos_cache, sin_cache;
@@ -861,6 +956,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     ncnn::Mat input_ids_mat = ncnn::Mat((int)token_ids.size(), 1, (void*)token_ids.data()).clone();
     ncnn::Mat token_embed;
     {
+        ncnn_llm::ScopedTimer t(pperf.embed_lookup);
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", input_ids_mat);
         require_extract(ex.extract("out0", token_embed), token_embed, "embed/out0");
@@ -877,6 +973,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     
     ncnn::Mat decode_out;
     {
+        ncnn_llm::ScopedTimer t(pperf.decoder_prompt);
         ncnn::Extractor ex = decoder_net->create_extractor();
         if (kv_alloc) {
             ex.set_kvcache_allocator(kv_alloc);
@@ -942,6 +1039,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     ncnn::Mat last_token_mat = ncnn::Mat(1, 1, (void*)&last_token_id).clone();
     ncnn::Mat last_token_embed;
     {
+        ncnn_llm::ScopedTimer t(pperf.last_token_embed);
         ncnn::Extractor ex = embed_net->create_extractor();
         ex.input("in0", last_token_mat);
         require_extract(ex.extract("out0", last_token_embed), last_token_embed, "embed/out0");
@@ -1029,11 +1127,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
     }
 
-    ncnn::Mat logits;
+        ncnn::Mat logits;
     {
-        ncnn::Extractor ex = proj_out_net->create_extractor();
-        ex.input("in0", decode_out);
-        require_extract(ex.extract("out0", logits), logits, "proj_out/out0");
+        ncnn_llm::ScopedTimer t(pperf.lm_head);
+        logits = lm_head->forward(decode_out, embed_net->opt);
     }
     
     int next_token_id = 0;
@@ -1048,12 +1145,37 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         }
     }
     new_ctx->cur_token = next_token_id;
+    const auto t_prefill_end = std::chrono::steady_clock::now();
+    pperf.total_ms += std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
+    pperf.prompt_tokens += total_prompt_tokens;
 
     return new_ctx;
 }
 
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<ncnn_llm_gpt_ctx>& ctx_in, const GenerateConfig& cfg, std::function<void(const std::string&)> callback) const {
     const int vocab_size = bpe->vocab_size();
+
+    int perf_lvl = 0;
+    if (cfg.perf_level > 0) {
+        perf_lvl = cfg.perf_level;
+    } else if (cfg.perf_level < 0) {
+        perf_lvl = 0;
+    } else if (cfg.enable_perf) {
+        perf_lvl = 1;
+    } else {
+        perf_lvl = ncnn_llm::get_perf_level();
+    }
+    bool do_perf = (perf_lvl > 0);
+
+    if (perf_lvl >= 2) {
+#if NCNN_BENCHMARK
+        ncnn::reset_layer_benchmark();
+        ncnn::set_layer_benchmark_active(true);
+#endif
+    }
+
+    ncnn_llm::DecodePerfStats decode_perf;
+    const auto t_decode_start = std::chrono::steady_clock::now();
 
     auto handle_tool = [&](const std::string& tool_call_text, std::shared_ptr<ncnn_llm_gpt_ctx>& ctx_ref) {
         nlohmann::json tool_call_json = parse_tool_call_payload(tool_call_text);
@@ -1110,97 +1232,122 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
             if (callback && (cfg.enable_thinking ||
                              (!flag_in_thinking && ctx->cur_token != think_id &&
                               ctx->cur_token != think_end_id))) {
-                callback(bpe->decode({ctx->cur_token}, false));
+                std::string token_str;
+                {
+                    ncnn_llm::ScopedTimer t(do_perf ? &decode_perf.tokenizer_decode : nullptr);
+                    token_str = bpe->decode({ctx->cur_token}, false);
+                }
+                {
+                    ncnn_llm::ScopedTimer t(do_perf ? &decode_perf.callback : nullptr);
+                    callback(token_str);
+                }
             }
         }
 
-        ncnn::Mat cur_embed = llm_run_text_embed(*embed_net, ctx->cur_token);
+        ncnn::Mat cur_embed;
+        {
+            ncnn_llm::ScopedTimer t(do_perf ? &decode_perf.embed_lookup : nullptr);
+            cur_embed = llm_run_text_embed(*embed_net, ctx->cur_token);
+        }
 
         ncnn::Mat cos_cache, sin_cache;
-        if (rope_type == RoPE_Type::LongRoPE) {
-            generate_rope_embed_cache_LongRoPE(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta, short_factor.data(), long_factor.data(), original_max_position_embeddings);
-        } else if (rope_type == RoPE_Type::NTK_RoPE) {
-            generate_ntk_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
-        } else if (rope_type == RoPE_Type::YARN_RoPE) {
-            generate_yarn_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
-        }
-        else {
-            generate_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta);
+        {
+            ncnn_llm::ScopedTimer t(do_perf ? &decode_perf.rope_gen : nullptr);
+            if (rope_type == RoPE_Type::LongRoPE) {
+                generate_rope_embed_cache_LongRoPE(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta, short_factor.data(), long_factor.data(), original_max_position_embeddings);
+            } else if (rope_type == RoPE_Type::NTK_RoPE) {
+                generate_ntk_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
+            } else if (rope_type == RoPE_Type::YARN_RoPE) {
+                generate_yarn_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
+            }
+            else {
+                generate_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta);
+            }
         }
         
         ctx->position_id++;
 
         ncnn::Mat mask(ctx->kv_cache[0].first.h + 1, 1);
-        mask.fill(0.f);
-
-        ncnn::Mat decode_out;
-        auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(ctx);
-        if (!qwen_ctx) {
-            decode_out = llm_run_decoder_with_kv(*decoder_net, cur_embed, mask, cos_cache, sin_cache,
-                                                 ctx->kv_cache, attn_cnt, false,
-                                                 ctx->kvcache_allocator ? ctx->kvcache_allocator.get() : nullptr,
-                                                 ctx->position_id + cfg.max_new_tokens);
-        } else {
-            ncnn::Extractor ex = decoder_net->create_extractor();
-            if (ctx->kvcache_allocator) {
-                ex.set_kvcache_allocator(ctx->kvcache_allocator.get());
-                ex.set_kvcache_max_seqlen_hint(ctx->position_id + cfg.max_new_tokens);
-            }
-            ex.input("in0", cur_embed);
-            ex.input("in1", mask);
-            ex.input("in2", cos_cache);
-            ex.input("in3", sin_cache);
-
-            for (int i = 0; i < attn_cnt; ++i) {
-                char kname[16], vname[16];
-                std::snprintf(kname, sizeof(kname), "cache_k%d", i);
-                std::snprintf(vname, sizeof(vname), "cache_v%d", i);
-                ex.input(kname, ctx->kv_cache[i].first);
-                ex.input(vname, ctx->kv_cache[i].second);
-                ctx->kv_cache[i].first.release();
-                ctx->kv_cache[i].second.release();
-            }
-
-            for (int i = 0; i < sconv_cnt; ++i) {
-                char name[16];
-                std::snprintf(name, sizeof(name), "cache_conv%d", i);
-                ex.input(name, qwen_ctx->sconv_cache[i]);
-            }
-            for (int i = 0; i < gdr_cnt; ++i) {
-                char name[16];
-                std::snprintf(name, sizeof(name), "cache_gdr%d", i);
-                ex.input(name, qwen_ctx->gdr_cache[i]);
-            }
-
-            for (int i = 0; i < attn_cnt; ++i) {
-                char kname[32], vname[32];
-                std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
-                std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
-                ncnn::Mat k_cache, v_cache;
-                require_extract(ex.extract(kname, k_cache, 1), k_cache, kname);
-                require_extract(ex.extract(vname, v_cache, 1), v_cache, vname);
-                ctx->kv_cache[i] = { std::move(k_cache), std::move(v_cache) };
-            }
-
-            for (int i = 0; i < sconv_cnt; ++i) {
-                char name[32];
-                std::snprintf(name, sizeof(name), "out_cache_conv%d", i);
-                ncnn::Mat cache;
-                require_extract(ex.extract(name, cache), cache, name);
-                qwen_ctx->sconv_cache[i] = std::move(cache);
-            }
-            for (int i = 0; i < gdr_cnt; ++i) {
-                char name[32];
-                std::snprintf(name, sizeof(name), "out_cache_gdr%d", i);
-                ncnn::Mat cache;
-                require_extract(ex.extract(name, cache), cache, name);
-                qwen_ctx->gdr_cache[i] = std::move(cache);
-            }
-
-            require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
+        {
+            ncnn_llm::ScopedTimer t(do_perf ? &decode_perf.mask_gen : nullptr);
+            mask.fill(0.f);
         }
 
-        ncnn::Mat logits_mat = llm_run_lm_head(*proj_out_net, decode_out);
+        ncnn::Mat decode_out;
+        {
+            ncnn_llm::ScopedTimer t(do_perf ? &decode_perf.decoder_step : nullptr);
+            auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(ctx);
+            if (!qwen_ctx) {
+                decode_out = llm_run_decoder_with_kv(*decoder_net, cur_embed, mask, cos_cache, sin_cache,
+                                                     ctx->kv_cache, attn_cnt, false,
+                                                     ctx->kvcache_allocator ? ctx->kvcache_allocator.get() : nullptr,
+                                                     ctx->position_id + cfg.max_new_tokens);
+            } else {
+                ncnn::Extractor ex = decoder_net->create_extractor();
+                if (ctx->kvcache_allocator) {
+                    ex.set_kvcache_allocator(ctx->kvcache_allocator.get());
+                    ex.set_kvcache_max_seqlen_hint(ctx->position_id + cfg.max_new_tokens);
+                }
+                ex.input("in0", cur_embed);
+                ex.input("in1", mask);
+                ex.input("in2", cos_cache);
+                ex.input("in3", sin_cache);
+
+                for (int i = 0; i < attn_cnt; ++i) {
+                    char kname[16], vname[16];
+                    std::snprintf(kname, sizeof(kname), "cache_k%d", i);
+                    std::snprintf(vname, sizeof(vname), "cache_v%d", i);
+                    ex.input(kname, ctx->kv_cache[i].first);
+                    ex.input(vname, ctx->kv_cache[i].second);
+                    ctx->kv_cache[i].first.release();
+                    ctx->kv_cache[i].second.release();
+                }
+
+                for (int i = 0; i < sconv_cnt; ++i) {
+                    char name[16];
+                    std::snprintf(name, sizeof(name), "cache_conv%d", i);
+                    ex.input(name, qwen_ctx->sconv_cache[i]);
+                }
+                for (int i = 0; i < gdr_cnt; ++i) {
+                    char name[16];
+                    std::snprintf(name, sizeof(name), "cache_gdr%d", i);
+                    ex.input(name, qwen_ctx->gdr_cache[i]);
+                }
+
+                for (int i = 0; i < attn_cnt; ++i) {
+                    char kname[32], vname[32];
+                    std::snprintf(kname, sizeof(kname), "out_cache_k%d", i);
+                    std::snprintf(vname, sizeof(vname), "out_cache_v%d", i);
+                    ncnn::Mat k_cache, v_cache;
+                    require_extract(ex.extract(kname, k_cache, 1), k_cache, kname);
+                    require_extract(ex.extract(vname, v_cache, 1), v_cache, vname);
+                    ctx->kv_cache[i] = { std::move(k_cache), std::move(v_cache) };
+                }
+
+                for (int i = 0; i < sconv_cnt; ++i) {
+                    char name[32];
+                    std::snprintf(name, sizeof(name), "out_cache_conv%d", i);
+                    ncnn::Mat cache;
+                    require_extract(ex.extract(name, cache), cache, name);
+                    qwen_ctx->sconv_cache[i] = std::move(cache);
+                }
+                for (int i = 0; i < gdr_cnt; ++i) {
+                    char name[32];
+                    std::snprintf(name, sizeof(name), "out_cache_gdr%d", i);
+                    ncnn::Mat cache;
+                    require_extract(ex.extract(name, cache), cache, name);
+                    qwen_ctx->gdr_cache[i] = std::move(cache);
+                }
+
+                require_extract(ex.extract("out0", decode_out), decode_out, "decoder/out0");
+            }
+        }
+
+        ncnn::Mat logits_mat;
+        {
+            ncnn_llm::ScopedTimer t(do_perf ? &decode_perf.lm_head : nullptr);
+            logits_mat = lm_head->forward(decode_out, embed_net->opt);
+        }
 
         LlmTokenSampleConfig sample_cfg;
         sample_cfg.vocab_size = vocab_size;
@@ -1209,15 +1356,53 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
         sample_cfg.top_k = cfg.top_k;
         sample_cfg.repetition_penalty = cfg.repetition_penalty;
         sample_cfg.do_sample = cfg.do_sample;
-        int next_id = llm_select_next_token(logits_mat, history_counts, sample_cfg, &generated_tokens);
+
+        int next_id = 0;
+        {
+            ncnn_llm::ScopedTimer t(do_perf ? &decode_perf.sampling : nullptr);
+            next_id = llm_select_next_token(logits_mat, history_counts, sample_cfg, &generated_tokens);
+        }
 
         ctx->cur_token = next_id;
         history_counts[next_id]++;
         generated_tokens.push_back(next_id);
+        decode_perf.decode_tokens++;
     }
+
+    const auto t_decode_end = std::chrono::steady_clock::now();
+    decode_perf.total_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
+
+    if (perf_lvl >= 2) {
+#if NCNN_BENCHMARK
+        ncnn::set_layer_benchmark_active(false);
+#endif
+    }
+
+    ncnn_llm::LlmPerfReport report;
+    report.meta.model_path = model_path_;
+    report.meta.model_type = model_type;
+    report.meta.num_threads = num_threads_;
+    report.meta.use_vulkan = use_vulkan_;
+    report.meta.use_bf16 = use_bf16_;
+    report.prefill = ctx->prefill_perf;
+    report.decode = decode_perf;
+
+#if NCNN_BENCHMARK
+    if (perf_lvl >= 2) {
+        report.has_layer_stats = true;
+        report.layer_type_stats = ncnn::get_layer_type_benchmark_stats();
+        report.layer_stats = ncnn::get_layer_benchmark_stats();
+    }
+#endif
+
+    last_perf_report = report;
+
+    if (do_perf) {
+        report.print(perf_lvl >= 2);
+    }
+
     return ctx;
 }
-
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::define_tools(const std::shared_ptr<ncnn_llm_gpt_ctx>& ctx, const std::vector<nlohmann::json>& tools, const std::string& system_prompt, TemplateType template_type) {
 
     this->tools = tools;
@@ -1542,4 +1727,12 @@ int ncnn_llm_gpt::get_visiual_features(const ncnn::Mat& bgr, ncnn::Mat& image_em
     }
     image_embeds = image_embeds_restored;
     return 0;
+}
+
+void ncnn_llm_gpt::print_last_perf_report(bool include_layer_stats) const {
+    last_perf_report.print(include_layer_stats);
+}
+
+std::string ncnn_llm_gpt::get_last_perf_report_str(bool include_layer_stats) const {
+    return last_perf_report.to_string(include_layer_stats);
 }

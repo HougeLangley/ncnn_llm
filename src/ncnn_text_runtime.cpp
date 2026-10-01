@@ -1,3 +1,4 @@
+﻿#include "kernel/lm_head.h"
 #include "ncnn_text_runtime.h"
 
 #include <algorithm>
@@ -84,6 +85,9 @@ ncnn::Mat llm_run_decoder_with_kv(ncnn::Net& decoder_net,
     return decode_out;
 }
 
+ncnn::Mat llm_run_lm_head(const ncnn_llm::LlmHead& lm_head, const ncnn::Mat& hidden_states, const ncnn::Option& opt) {
+    return lm_head.forward(hidden_states, opt);
+}
 ncnn::Mat llm_run_lm_head(ncnn::Net& lm_head_net, const ncnn::Mat& hidden_states) {
     ncnn::Mat logits;
     ncnn::Extractor ex = lm_head_net.create_extractor();

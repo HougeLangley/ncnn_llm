@@ -1,4 +1,4 @@
-﻿# deps_ncnn.cmake
+# deps_ncnn.cmake
 # Handle ncnn dependency: either use a system-installed ncnn or build the
 # bundled ncnn submodule (inspired by LiteOCR and wan-ncnn-vulkan).
 
@@ -96,6 +96,7 @@ if(NOT USE_SYSTEM_NCNN)
     set(NCNN_STDIO ON CACHE BOOL "" FORCE)
     set(NCNN_SIMPLESTL OFF CACHE BOOL "" FORCE)
     set(NCNN_BUILD_WITH_STATIC_CRT OFF CACHE BOOL "" FORCE)
+    set(NCNN_BENCHMARK ON CACHE BOOL "" FORCE)
 
     add_subdirectory(ncnn)
 endif()
