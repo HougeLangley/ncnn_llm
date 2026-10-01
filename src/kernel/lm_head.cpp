@@ -1,4 +1,7 @@
-﻿#include "kernel/lm_head.h"
+﻿#if defined(__x86_64__) || defined(_M_X64)
+#include "kernel/x86/lm_head_x86.h"
+#endif
+#include "kernel/lm_head.h"
 
 #include <fstream>
 #include <sstream>
@@ -8,11 +11,14 @@
 #include <layer.h>
 #include <modelbin.h>
 #include <paramdict.h>
+#include <cpu.h>
 #include "layer_type.h"
 
 namespace ncnn_llm {
 
-LlmHead::LlmHead() {
+LlmHead::LlmHead()
+    : gemm_layer_(nullptr), vocab_size_(0), hidden_size_(0),
+      initialized_(false), is_shared_(false) {
 }
 
 LlmHead::~LlmHead() {
@@ -115,15 +121,14 @@ int LlmHead::init_from_file(const std::string& proj_out_param_path,
         delete gemm_layer_;
         gemm_layer_ = nullptr;
     }
+    fallback_net_.reset();
     initialized_ = false;
     is_shared_ = false;
 
     fallback_net_ = std::make_shared<ncnn::Net>();
     fallback_net_->opt = opt;
-
     int ret = fallback_net_->load_param(proj_out_param_path.c_str());
     if (ret != 0) return ret;
-
     ret = fallback_net_->load_model(proj_out_bin_path.c_str());
     if (ret != 0) return ret;
 
@@ -134,6 +139,33 @@ int LlmHead::init_from_file(const std::string& proj_out_param_path,
 
 ncnn::Mat LlmHead::forward(const ncnn::Mat& hidden_states, const ncnn::Option& opt) const {
     if (gemm_layer_) {
+#if defined(__x86_64__) || defined(_M_X64)
+        const int M = hidden_states.dims == 1 ? 1 : hidden_states.h;
+        const int K = hidden_states.w;
+        if (M == 1 && is_shared_ && !shared_weight_.empty() && K == hidden_size_) {
+            const int threads = opt.num_threads > 0 ? opt.num_threads : ncnn::get_cpu_count();
+            if (shared_weight_.elemsize == sizeof(unsigned short)) {
+                if (hidden_states.elemsize == sizeof(unsigned short)) {
+                    ncnn::Mat logits(vocab_size_, 1, 4u, opt.blob_allocator);
+                    gemv_bf16_x86((const unsigned short*)hidden_states,
+                                  (const unsigned short*)shared_weight_,
+                                  (float*)logits, vocab_size_, hidden_size_, threads);
+                    return logits;
+                } else if (hidden_states.elemsize == sizeof(float)) {
+                    ncnn::Mat logits(vocab_size_, 1, 4u, opt.blob_allocator);
+                    gemv_bf16_fp32_x86((const float*)hidden_states,
+                                       (const unsigned short*)shared_weight_,
+                                       (float*)logits, vocab_size_, hidden_size_, threads);
+                    return logits;
+                }
+            } else if (shared_weight_.elemsize == sizeof(float) && hidden_states.elemsize == sizeof(float)) {
+                ncnn::Mat logits(vocab_size_, 1, 4u, opt.blob_allocator);
+                gemv_fp32_x86((const float*)hidden_states, (const float*)shared_weight_, (float*)logits,
+                              vocab_size_, hidden_size_, threads);
+                return logits;
+            }
+        }
+#endif
         ncnn::Mat in_blob = hidden_states;
         if (in_blob.dims == 1) {
             in_blob = in_blob.reshape(in_blob.w, 1);

@@ -76,7 +76,13 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x86|i[3-6]86" OR CMAKE_GENERATOR
     list(APPEND NCNN_LLM_SOURCES
         src/kernel/x86/gdr_x86.cpp
         src/kernel/x86/shortconv_x86.cpp
+        src/kernel/x86/lm_head_x86.cpp
     )
+    if(MSVC)
+        set_source_files_properties(src/kernel/x86/lm_head_x86.cpp PROPERTIES COMPILE_FLAGS "/arch:AVX2")
+    else()
+        set_source_files_properties(src/kernel/x86/lm_head_x86.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
+    endif()
 endif()
 
 add_library(ncnn_llm STATIC ${NCNN_LLM_SOURCES})

@@ -135,7 +135,13 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
         
         model_path_ = model_path;
         use_vulkan_ = use_vulkan;
-        num_threads_ = num_threads > 0 ? num_threads : ncnn::get_cpu_count();
+        {
+            int default_threads = ncnn::get_physical_big_cpu_count();
+            if (default_threads <= 0) default_threads = ncnn::get_physical_cpu_count();
+            if (default_threads <= 0) default_threads = ncnn::get_cpu_count();
+            default_threads = std::clamp(default_threads, 1, 8);
+            num_threads_ = num_threads > 0 ? num_threads : default_threads;
+        }
         vulkan_device_ = vulkan_device;
         use_bf16_ = use_bf16;
 
@@ -145,12 +151,10 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
         proj_out_net = std::make_shared<ncnn::Net>();
         lm_head = std::make_shared<ncnn_llm::LlmHead>();
 
-        // Set number of threads (0 = use ncnn default which is get_cpu_count())
-        if (num_threads > 0) {
-            decoder_net->opt.num_threads = num_threads;
-            embed_net->opt.num_threads = num_threads;
-            proj_out_net->opt.num_threads = num_threads;
-        }
+        // Set number of threads across all nets
+        decoder_net->opt.num_threads = num_threads_;
+        embed_net->opt.num_threads = num_threads_;
+        proj_out_net->opt.num_threads = num_threads_;
 
         if (use_vulkan) {
             printf("[ncnn_llm_gpt] Vulkan enabled, using device %d\n", vulkan_device >= 0 ? vulkan_device : 0);
