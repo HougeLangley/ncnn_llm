@@ -148,6 +148,43 @@ void gemv_bf16_fp32_x86(const float* x, const unsigned short* weight, float* log
             __m256 acc6 = _mm256_setzero_ps();
             __m256 acc7 = _mm256_setzero_ps();
 
+            for (; k + 15 < K; k += 16) {
+                __m256 vx0 = _mm256_loadu_ps(x + k);
+                __m256 vx1 = _mm256_loadu_ps(x + k + 8);
+
+                _mm_prefetch((const char*)(w0 + k + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w1 + k + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w2 + k + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w3 + k + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w4 + k + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w5 + k + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w6 + k + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w7 + k + 64), _MM_HINT_T0);
+
+                acc0 = _mm256_fmadd_ps(vx0, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w0 + k))), acc0);
+                acc0 = _mm256_fmadd_ps(vx1, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w0 + k + 8))), acc0);
+
+                acc1 = _mm256_fmadd_ps(vx0, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w1 + k))), acc1);
+                acc1 = _mm256_fmadd_ps(vx1, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w1 + k + 8))), acc1);
+
+                acc2 = _mm256_fmadd_ps(vx0, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w2 + k))), acc2);
+                acc2 = _mm256_fmadd_ps(vx1, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w2 + k + 8))), acc2);
+
+                acc3 = _mm256_fmadd_ps(vx0, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w3 + k))), acc3);
+                acc3 = _mm256_fmadd_ps(vx1, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w3 + k + 8))), acc3);
+
+                acc4 = _mm256_fmadd_ps(vx0, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w4 + k))), acc4);
+                acc4 = _mm256_fmadd_ps(vx1, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w4 + k + 8))), acc4);
+
+                acc5 = _mm256_fmadd_ps(vx0, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w5 + k))), acc5);
+                acc5 = _mm256_fmadd_ps(vx1, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w5 + k + 8))), acc5);
+
+                acc6 = _mm256_fmadd_ps(vx0, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w6 + k))), acc6);
+                acc6 = _mm256_fmadd_ps(vx1, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w6 + k + 8))), acc6);
+
+                acc7 = _mm256_fmadd_ps(vx0, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w7 + k))), acc7);
+                acc7 = _mm256_fmadd_ps(vx1, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w7 + k + 8))), acc7);
+            }
             for (; k + 7 < K; k += 8) {
                 __m256 vx = _mm256_loadu_ps(x + k);
                 acc0 = _mm256_fmadd_ps(vx, bfloat2float_avx2(_mm_loadu_si128((const __m128i*)(w0 + k))), acc0);
