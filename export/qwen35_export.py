@@ -134,7 +134,7 @@ class Qwen35Decoder(nn.Module):
         sconv = []
         gdr = []
         for layer in self.language_model.layers:
-            if layer.layer_type == "linear_attention":
+            if getattr(layer, "layer_type", getattr(layer, "block_type", None)) == "linear_attention":
                 la = layer.linear_attn
                 self.sconv_indices.append(len(sconv))
                 self.gdr_indices.append(len(gdr))
@@ -208,7 +208,7 @@ class Qwen35Decoder(nn.Module):
         for li, layer in enumerate(self.language_model.layers):
             residual = x
             x = _rms(x, layer.input_layernorm.weight, self.eps)
-            if layer.layer_type == "linear_attention":
+            if getattr(layer, "layer_type", getattr(layer, "block_type", None)) == "linear_attention":
                 x, new_conv, new_gdr = self._linear_attention(
                     x, layer, conv_states[si], gdr_states[gi],
                     self.sconv_ops[si], self.gdr_ops[gi])
@@ -246,6 +246,8 @@ def _rename_cache_io(param_path, conv_count, gdr_count):
     # pnnx can serialize the GQA inputs as query,value,key when value has
     # more heads than key. The runtime contract is always query,key,value.
     reshape_heads = {}
+    reshape_src = {}
+    slice_pos = {}
     for line in lines[2:]:
         fields = line.split()
         if len(fields) < 7 or fields[0] != "Reshape":
@@ -257,7 +259,22 @@ def _rename_cache_io(param_path, conv_count, gdr_count):
             attrs = fields[4 + bottom_count + top_count:]
             head_attr = next(x for x in attrs if x.startswith("1="))
             reshape_heads[outputs[0]] = int(float(head_attr[2:]))
+            reshape_src[outputs[0]] = fields[4]  # Reshape 的输入 blob
         except (ValueError, StopIteration, IndexError):
+            continue
+
+    # Slice 层：top blob -> 切片序号（q=0,k=1,v=2 的位置契约）
+    for line in lines[2:]:
+        fields = line.split()
+        if len(fields) < 7 or fields[0] != "Slice":
+            continue
+        try:
+            bottom_count = int(fields[2])
+            top_count = int(fields[3])
+            outputs = fields[4 + bottom_count:4 + bottom_count + top_count]
+            for idx, name in enumerate(outputs):
+                slice_pos[name] = idx
+        except (ValueError, IndexError):
             continue
 
     body = []
@@ -284,6 +301,17 @@ def _rename_cache_io(param_path, conv_count, gdr_count):
                 if q_heads is not None and q_heads == v_heads and k_heads != q_heads:
                     bottom_ids[5], bottom_ids[6] = bottom_ids[6], bottom_ids[5]
                     fields[4:4 + bottom_count] = bottom_ids
+                elif (q_heads is not None and k_heads is not None and v_heads is not None
+                      and q_heads == k_heads == v_heads):
+                    # 头数全等时头数启发式失效（如 qwen3.5-2b: 16/16/16）：
+                    # 回退到 Slice 位置溯源 —— q/k/v 必须按切片顺序 0/1/2 排列。
+                    # reshape_src[blob] = 其输入 blob；slice_pos[blob] = 它在 Slice tops 中的序号
+                    pos = [slice_pos.get(reshape_src.get(b, ""), -1) for b in bottom_ids[4:7]]
+                    if all(p >= 0 for p in pos) and pos != sorted(pos):
+                        order = sorted(range(3), key=lambda i: pos[i])
+                        qkv = [bottom_ids[4 + i] for i in order]
+                        bottom_ids[4:7] = qkv
+                        fields[4:4 + bottom_count] = bottom_ids
         fields = [replacements.get(x, x) for x in fields]
         # Keep the custom-op contract as (weight, mixed_qkv, state). pnnx
         # can emit the state before mixed_qkv, which makes prefill consume an
@@ -380,7 +408,7 @@ def export(model_dir, output_dir, int8_dir="", prefix="", keep_fp32=True,
         # those optional packages are installed. Replace those two kernels in
         # the reference copy so validation remains portable and deterministic.
         for layer in model.model.language_model.layers:
-            if layer.layer_type == "linear_attention":
+            if getattr(layer, "layer_type", getattr(layer, "block_type", None)) == "linear_attention":
                 layer.linear_attn.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
                 layer.linear_attn.recurrent_gated_delta_rule = torch_chunk_gated_delta_rule
                 layer.linear_attn.norm = PortableGatedNorm(layer.linear_attn.norm)
@@ -393,7 +421,9 @@ def export(model_dir, output_dir, int8_dir="", prefix="", keep_fp32=True,
         hidden_in = embed(ids)
         mask = torch.triu(torch.ones(seq, seq) * float("-inf"), diagonal=1)[None, None]
         pos = torch.arange(seq, dtype=torch.long).view(1, -1)
-        cos_full, sin_full = model.model.language_model.rotary_emb(hidden_in, pos)
+        # transformers>=5.10: qwen3_5 rotary_emb 走 mrope 路径，要求 (3, bs, seq)
+        pos3 = pos.unsqueeze(0).expand(3, -1, -1)
+        cos_full, sin_full = model.model.language_model.rotary_emb(hidden_in, pos3)
         cos = cos_full[..., :rope_dim // 2]
         sin = sin_full[..., :rope_dim // 2]
         conv_states = [torch.zeros(1, conv_dim, conv_kernel) for _ in range(linear_layers)]
