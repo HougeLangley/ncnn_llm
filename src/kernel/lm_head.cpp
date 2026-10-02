@@ -102,7 +102,20 @@ int LlmHead::init_shared(const std::string& proj_out_param_path,
         return ret_load;
     }
 
+#if defined(__riscv)
+    // On riscv the bare-layer Gemm only built the fp16s pipeline, but the
+    // decoder hidden states arrive as fp32 (extract() deinterleaves), which
+    // then falls into the never-built fp32 path and crashes (empty BT_data).
+    // Build the pipeline as fp32: LM head is an M=1 bandwidth-bound GEMV,
+    // so the fp16 savings do not matter here.
+    ncnn::Option opt_fp32 = opt;
+    opt_fp32.use_fp16_storage = false;
+    opt_fp32.use_fp16_arithmetic = false;
+    opt_fp32.use_fp16_packed = false;
+    int ret_pipe = gemm_layer_->create_pipeline(opt_fp32);
+#else
     int ret_pipe = gemm_layer_->create_pipeline(opt);
+#endif
     if (ret_pipe != 0) {
         delete gemm_layer_;
         gemm_layer_ = nullptr;
