@@ -164,6 +164,27 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
             decoder_net->opt.use_vulkan_compute = true;
         } else {
             printf("[ncnn_llm_gpt] Vulkan disabled, using CPU only\n");
+#if defined(__riscv)
+            // riscv CPUs have no fp16 GEMM/UnaryOp coverage for the
+            // decomposed gated-norm chains used by qwen3.5 hybrid models
+            // (pow->mean->rsqrt->mul on ~1e-2 magnitude activations):
+            // fp16 storage collapses precision and greedy decoding degenerates
+            // to token 0. Default to the fp32 path; NCNN_RISCV_FP16=1
+            // re-enables fp16 for models that are known to work.
+            const char* fp16env = getenv("NCNN_RISCV_FP16");
+            if (!(fp16env && fp16env[0] == '1')) {
+                decoder_net->opt.use_fp16_storage = false;
+                decoder_net->opt.use_fp16_arithmetic = false;
+                decoder_net->opt.use_fp16_packed = false;
+                embed_net->opt.use_fp16_storage = false;
+                embed_net->opt.use_fp16_arithmetic = false;
+                embed_net->opt.use_fp16_packed = false;
+                proj_out_net->opt.use_fp16_storage = false;
+                proj_out_net->opt.use_fp16_arithmetic = false;
+                proj_out_net->opt.use_fp16_packed = false;
+                printf("[ncnn_llm_gpt] riscv CPU: fp32 path (set NCNN_RISCV_FP16=1 to override)\n");
+            }
+#endif
         }
 
         if (use_bf16) {
