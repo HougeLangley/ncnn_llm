@@ -194,6 +194,43 @@ ncnnllm2int decoder.ncnn.param decoder.ncnn.bin decoder_int8.ncnn.param decoder_
 ```
 > 注：Gemm weight block quantization 当前在 CPU 后端提供高效向量化计算（支持 AVX2 / AVX-VNNI / ARM 等），运行时检测到量化层时会自动在 CPU 执行。
 
+### SpaceMiT K3：IME2 int8 权重模式（`NCNN_IME2_INT8=1`）
+
+在 SpaceMiT K3（A100 簇，`smt.vfwmadot` IME2）上，IME2 的 Gemm 路径可以把权重保存为
+**int8 + 每列一个 fp16 scale**，而不是 fp16。这样整数域乘加仍由 IME2 单元完成，
+同时**权重字节数减半** —— 这对**带宽受限的 M=1 解码路径**收益最大。
+
+```bash
+# 面向解码的优化：int8 权重
+NCNN_IME2_INT8=1 ai-run ./build/ncnn_llm_server --model assets/qwen3_0.6b --threads 8 --port 9200
+```
+
+用 llama-benchy 0.4.0 实测（Qwen3-0.6B、threads=8、A100 簇 cpu8-15、runs=3、
+重新编译的 clang 24 二进制；两种配置在**同一会话内**测量）：
+
+| 用例 | fp16（默认）| int8 | 变化 |
+|---|---|---|---|
+| tg32 @ pp128 | 7.09 t/s | **8.52 t/s** | **+20.2%** |
+| tg128 @ pp128 | 7.02 t/s | **8.44 t/s** | **+20.2%** |
+| tg32 @ pp512 | 6.63 t/s | **7.88 t/s** | **+18.9%** |
+| tg128 @ pp512 | 6.54 t/s | **7.83 t/s** | **+19.7%** |
+| tg32 @ pp1024 | 6.15 t/s | **7.28 t/s** | **+18.4%** |
+| tg128 @ pp1024 | 6.08 t/s | **7.21 t/s** | **+18.6%** |
+| pp128 | 299.67 t/s | 308.64 t/s | 基本持平 |
+| pp512 | 352.65 t/s | 338.25 t/s | −3.8% |
+| pp1024 | 305.94 t/s | 299.95 t/s | −1.9% |
+
+* **解码：所有用例均提升 18.4% ~ 20.2%**（平均 **+19.3%**）。
+* **预填充：下降 1.9% ~ 3.8%** —— 这是"面向解码"模式的代价。
+* **两种配置的 Coherence 测试均 PASSED**（llama-benchy 的事实性问答检查），
+  且实测生成文本与 fp16 路径一致。
+
+统计图（实测数据，非模型推算）：[解码对比](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/01_decode_int8_vs_fp16.png) ·
+[预填充取舍](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/02_prefill_tradeoff.png) · [解码加速比](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/03_decode_speedup.png)
+
+> 该模式**可选、默认关闭**；无论是否设置该变量，fp16 路径都保持逐字节不变。
+> 交互式/以解码为主的场景适合 int8，长 prompt 预填充仍以 fp16 更优。
+
 ## OCR
 
 GLM-OCR 使用专用的图像 prefill 路径，并复用共享文本解码运行时。

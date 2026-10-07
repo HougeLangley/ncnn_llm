@@ -194,6 +194,45 @@ ncnnllm2int decoder.ncnn.param decoder.ncnn.bin decoder_int8.ncnn.param decoder_
 ```
 > Note: Gemm weight block quantization currently provides optimized vectorized kernels on the CPU backend (AVX2 / AVX-VNNI / ARM, etc.). The runtime will automatically execute quantized layers on CPU.
 
+### SpaceMiT K3: IME2 int8 weight mode (`NCNN_IME2_INT8=1`)
+
+On SpaceMiT K3 (A100 cluster, `smt.vfwmadot` IME2), the IME2 Gemm path can hold its weights
+as **int8 with one fp16 scale per column** instead of fp16. This keeps the integer-domain
+product in the IME2 unit and halves the weight bytes, which matters most for the
+**bandwidth-bound M=1 decode path**.
+
+```bash
+# decode-optimised: int8 weights
+NCNN_IME2_INT8=1 ai-run ./build/ncnn_llm_server --model assets/qwen3_0.6b --threads 8 --port 9200
+```
+
+Measured with llama-benchy 0.4.0 (Qwen3-0.6B, threads=8, A100 cluster cpu8-15, runs=3,
+freshly rebuilt clang 24 binary; both configurations measured in the same session):
+
+| case | fp16 (default) | int8 | change |
+|---|---|---|---|
+| tg32 @ pp128 | 7.09 t/s | **8.52 t/s** | **+20.2%** |
+| tg128 @ pp128 | 7.02 t/s | **8.44 t/s** | **+20.2%** |
+| tg32 @ pp512 | 6.63 t/s | **7.88 t/s** | **+18.9%** |
+| tg128 @ pp512 | 6.54 t/s | **7.83 t/s** | **+19.7%** |
+| tg32 @ pp1024 | 6.15 t/s | **7.28 t/s** | **+18.4%** |
+| tg128 @ pp1024 | 6.08 t/s | **7.21 t/s** | **+18.6%** |
+| pp128 | 299.67 t/s | 308.64 t/s | ~flat |
+| pp512 | 352.65 t/s | 338.25 t/s | -3.8% |
+| pp1024 | 305.94 t/s | 299.95 t/s | -1.9% |
+
+* **Decode: +18.4% .. +20.2%** in every measured case (average +19.3%).
+* **Prefill: -1.9% .. -3.8%** - the trade-off for a decode-oriented mode.
+* **Coherence test PASSED for both configurations** (llama-benchy factual Q&A check), and
+  generated text is identical to the fp16 path in our runs.
+
+Charts (measured, not modelled): [decode comparison](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/01_decode_int8_vs_fp16.png) ·
+[prefill trade-off](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/02_prefill_tradeoff.png) · [decode speed-up](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/03_decode_speedup.png)
+
+> The mode is **opt-in and off by default**; the fp16 path is byte-identical whether or not
+> the variable is set. int8 is a good default for interactive/decoding use, while fp16
+> remains better for long-prompt prefill.
+
 ## OCR
 
 GLM-OCR uses a dedicated image prefill path and the shared text decode runtime.
