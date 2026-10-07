@@ -165,14 +165,18 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
         } else {
             printf("[ncnn_llm_gpt] Vulkan disabled, using CPU only\n");
 #if defined(__riscv)
-            // riscv CPUs have no fp16 GEMM/UnaryOp coverage for the
-            // decomposed gated-norm chains used by qwen3.5 hybrid models
-            // (pow->mean->rsqrt->mul on ~1e-2 magnitude activations):
-            // fp16 storage collapses precision and greedy decoding degenerates
-            // to token 0. Default to the fp32 path; NCNN_RISCV_FP16=1
-            // re-enables fp16 for models that are known to work.
+            // riscv CPUs have no fp16 coverage for the decomposed gated-norm chains
+            // used by qwen3.5 hybrid models (pow->mean->rsqrt->mul on ~1e-2 magnitude activations):
+            // fp16 storage collapses precision and greedy decoding degenerates to token 0.
+            // Scope default fp32 to qwen3.5 to preserve SpaceMiT IME2 (smt.vfwmadot)
+            // acceleration on qwen3; allow NCNN_RISCV_FP16=1 or NCNN_RISCV_FP32=1 to override.
+            const std::string model_type = config.value("type", "");
             const char* fp16env = getenv("NCNN_RISCV_FP16");
-            if (!(fp16env && fp16env[0] == '1')) {
+            const char* fp32env = getenv("NCNN_RISCV_FP32");
+            bool force_fp32 = (fp32env && fp32env[0] == '1');
+            bool force_fp16 = (fp16env && fp16env[0] == '1');
+            bool need_fp32 = force_fp32 || (!force_fp16 && model_type == "qwen3.5");
+            if (need_fp32) {
                 decoder_net->opt.use_fp16_storage = false;
                 decoder_net->opt.use_fp16_arithmetic = false;
                 decoder_net->opt.use_fp16_packed = false;
@@ -182,7 +186,8 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
                 proj_out_net->opt.use_fp16_storage = false;
                 proj_out_net->opt.use_fp16_arithmetic = false;
                 proj_out_net->opt.use_fp16_packed = false;
-                printf("[ncnn_llm_gpt] riscv CPU: fp32 path (set NCNN_RISCV_FP16=1 to override)\n");
+                printf("[ncnn_llm_gpt] riscv CPU: fp32 path enabled for %s (set NCNN_RISCV_FP16=1 to override)\n",
+                       model_type.c_str());
             }
 #endif
         }

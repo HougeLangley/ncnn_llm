@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include <queue>
 #include <vector>
@@ -474,9 +475,10 @@ std::vector<int> BpeTokenizer::encode(const std::string& text,
                                       bool add_sep) const {
     /* 剖析（NCNN_BPE_PROF=1 ✓）：定位 tokenizer 热点 ✓ */
     static const bool bprof = (getenv("NCNN_BPE_PROF") != nullptr);
-    struct timespec _bt0, _bt1;
-    if (bprof) clock_gettime(CLOCK_MONOTONIC, &_bt0);
-    double _t_scan = 0, _t_bpe = 0;
+    using bpe_clock = std::chrono::steady_clock;
+    bpe_clock::time_point _bt0;
+    if (bprof) _bt0 = bpe_clock::now();
+    double _t_scan = 0;
 
     std::vector<int> ids;
     ids.reserve(text.size() / 2 + 8);
@@ -518,8 +520,8 @@ std::vector<int> BpeTokenizer::encode(const std::string& text,
         size_t matched_len = 0;
 
         // longest match：若多个 special token 共享前缀，选择更长的那个
-        struct timespec _sc0, _sc1;
-        if (bprof) clock_gettime(CLOCK_MONOTONIC, &_sc0);
+        bpe_clock::time_point _sc0;
+        if (bprof) _sc0 = bpe_clock::now();
         if (!additional_special_tokens_.empty()) {
             for (size_t k = 0; k < additional_special_tokens_.size(); ++k) {
                 const std::string& sp = additional_special_tokens_[k];
@@ -533,8 +535,10 @@ std::vector<int> BpeTokenizer::encode(const std::string& text,
             }
         }
 
-        if (bprof) { clock_gettime(CLOCK_MONOTONIC, &_sc1);
-            _t_scan += (_sc1.tv_sec - _sc0.tv_sec) * 1000.0 + (_sc1.tv_nsec - _sc0.tv_nsec) / 1e6; }
+        if (bprof) {
+            auto _sc1 = bpe_clock::now();
+            _t_scan += std::chrono::duration<double, std::milli>(_sc1 - _sc0).count();
+        }
         if (matched_index >= 0) {
             flush_buffer();
             ids.push_back(additional_special_token_ids_[matched_index]);
@@ -551,8 +555,8 @@ std::vector<int> BpeTokenizer::encode(const std::string& text,
     if (add_sep && special_ids_.sep_id >= 0) ids.push_back(special_ids_.sep_id);
     if (add_eos && special_ids_.eos_id >= 0) ids.push_back(special_ids_.eos_id);
     if (bprof) {
-        clock_gettime(CLOCK_MONOTONIC, &_bt1);
-        const double tot = (_bt1.tv_sec - _bt0.tv_sec) * 1000.0 + (_bt1.tv_nsec - _bt0.tv_nsec) / 1e6;
+        auto _bt1 = bpe_clock::now();
+        const double tot = std::chrono::duration<double, std::milli>(_bt1 - _bt0).count();
         fprintf(stderr, "[BPE-PROF] text=%zu 字符 special_tokens=%zu → ids=%zu | 总 %.2f ms | 扫描 %.2f ms (%.1f%%) | 其余(BPE等) %.2f ms (%.1f%%)\n",
                 text.size(), additional_special_tokens_.size(), ids.size(),
                 tot, _t_scan, tot > 0 ? 100.0 * _t_scan / tot : 0.0,
