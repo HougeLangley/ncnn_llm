@@ -1,3 +1,6 @@
+#include <cstdio>
+#include <queue>
+#include <vector>
 #include "bpe_tokenizer.h"
 #include <fstream>
 #include <sstream>
@@ -251,29 +254,61 @@ const std::vector<std::string>& BpeTokenizer::BpeForPieceCached(const std::strin
 
 std::vector<std::string> BpeTokenizer::BpeForPiece(const std::string& piece) const {
     std::vector<std::string> symbols = Utf8Chars(piece);
-    if (symbols.size() <= 1) return symbols;
+    const int n0 = static_cast<int>(symbols.size());
+    if (n0 <= 1) return symbols;
 
-    while (symbols.size() >= 2) {
-        int best_rank = std::numeric_limits<int>::max();
-        int best_i = -1;
+    /* 原实现是 O(n^2 * L)：每轮都重新扫描全部相邻对并做哈希查找，再用 vector::erase
+     * 做 O(n) 搬移。实测 2038 字符的整段 prompt 走一次要 470 ms（占 tokenizer 的 99.6%）。
+     * 这里改成标准做法：双向链表维护符号序列 + 小顶堆取最小 rank 的相邻对。
+     * 复杂度 O(n log n)，且【保持原有的语义】：原实现用 `r < best_rank` 严格小于，
+     * 因此同 rank 时取最左的那一对 —— 堆的比较器用 (rank, left) 排序即可复现该行为。 */
+    std::vector<int> prev(n0), next(n0);
+    std::vector<char> alive(n0, 1);
+    for (int i = 0; i < n0; i++) { prev[i] = i - 1; next[i] = i + 1; }
+    next[n0 - 1] = -1;
 
-        for (int i = 0; i + 1 < static_cast<int>(symbols.size()); ++i) {
-            std::string key = PairKey(symbols[i], symbols[i + 1]);
-            auto it = merges_rank_.find(key);
-            if (it != merges_rank_.end()) {
-                int r = it->second;
-                if (r < best_rank) {
-                    best_rank = r;
-                    best_i = i;
-                }
-            }
+    struct PairNode { int rank; int left; };
+    struct PairCmp {
+        bool operator()(const PairNode& a, const PairNode& b) const {
+            if (a.rank != b.rank) return a.rank > b.rank;  // 小顶堆
+            return a.left > b.left;                        // 同 rank 取最左 ✓
         }
-        if (best_i < 0) break;
+    };
+    std::priority_queue<PairNode, std::vector<PairNode>, PairCmp> pq;
 
-        symbols[best_i] += symbols[best_i + 1];
-        symbols.erase(symbols.begin() + best_i + 1);
+    auto push_pair = [&](int left) {
+        if (left < 0 || !alive[left]) return;
+        const int right = next[left];
+        if (right < 0 || !alive[right]) return;
+        auto it = merges_rank_.find(PairKey(symbols[left], symbols[right]));
+        if (it != merges_rank_.end()) pq.push(PairNode{it->second, left});
+    };
+
+    for (int i = 0; i + 1 < n0; i++) push_pair(i);
+
+    while (!pq.empty()) {
+        const PairNode node = pq.top();
+        pq.pop();
+        const int l = node.left;
+        if (!alive[l]) continue;
+        const int r = next[l];
+        if (r < 0 || !alive[r]) continue;
+        /* 惰性校验：该对的 rank 可能已因合并而改变 */
+        auto it = merges_rank_.find(PairKey(symbols[l], symbols[r]));
+        if (it == merges_rank_.end() || it->second != node.rank) continue;
+
+        symbols[l] += symbols[r];   /* 合并到左符号 ✓ */
+        alive[r] = 0;
+        next[l] = next[r];
+        if (next[r] >= 0) prev[next[r]] = l;
+        push_pair(l);               /* 新形成的邻接对 ✓ */
+        if (prev[l] >= 0) push_pair(prev[l]);
     }
-    return symbols;
+
+    std::vector<std::string> out;
+    out.reserve(n0);
+    for (int i = 0; i >= 0; i = next[i]) out.push_back(std::move(symbols[i]));
+    return out;
 }
 
 void BpeTokenizer::TokensToIds(const std::vector<std::string>& tokens, std::vector<int>& out) const {
@@ -437,6 +472,12 @@ std::vector<int> BpeTokenizer::encode(const std::string& text,
                                       bool add_eos,
                                       bool add_cls,
                                       bool add_sep) const {
+    /* 剖析（NCNN_BPE_PROF=1 ✓）：定位 tokenizer 热点 ✓ */
+    static const bool bprof = (getenv("NCNN_BPE_PROF") != nullptr);
+    struct timespec _bt0, _bt1;
+    if (bprof) clock_gettime(CLOCK_MONOTONIC, &_bt0);
+    double _t_scan = 0, _t_bpe = 0;
+
     std::vector<int> ids;
     ids.reserve(text.size() / 2 + 8);
 
@@ -477,6 +518,8 @@ std::vector<int> BpeTokenizer::encode(const std::string& text,
         size_t matched_len = 0;
 
         // longest match：若多个 special token 共享前缀，选择更长的那个
+        struct timespec _sc0, _sc1;
+        if (bprof) clock_gettime(CLOCK_MONOTONIC, &_sc0);
         if (!additional_special_tokens_.empty()) {
             for (size_t k = 0; k < additional_special_tokens_.size(); ++k) {
                 const std::string& sp = additional_special_tokens_[k];
@@ -490,6 +533,8 @@ std::vector<int> BpeTokenizer::encode(const std::string& text,
             }
         }
 
+        if (bprof) { clock_gettime(CLOCK_MONOTONIC, &_sc1);
+            _t_scan += (_sc1.tv_sec - _sc0.tv_sec) * 1000.0 + (_sc1.tv_nsec - _sc0.tv_nsec) / 1e6; }
         if (matched_index >= 0) {
             flush_buffer();
             ids.push_back(additional_special_token_ids_[matched_index]);
@@ -505,6 +550,15 @@ std::vector<int> BpeTokenizer::encode(const std::string& text,
 
     if (add_sep && special_ids_.sep_id >= 0) ids.push_back(special_ids_.sep_id);
     if (add_eos && special_ids_.eos_id >= 0) ids.push_back(special_ids_.eos_id);
+    if (bprof) {
+        clock_gettime(CLOCK_MONOTONIC, &_bt1);
+        const double tot = (_bt1.tv_sec - _bt0.tv_sec) * 1000.0 + (_bt1.tv_nsec - _bt0.tv_nsec) / 1e6;
+        fprintf(stderr, "[BPE-PROF] text=%zu 字符 special_tokens=%zu → ids=%zu | 总 %.2f ms | 扫描 %.2f ms (%.1f%%) | 其余(BPE等) %.2f ms (%.1f%%)\n",
+                text.size(), additional_special_tokens_.size(), ids.size(),
+                tot, _t_scan, tot > 0 ? 100.0 * _t_scan / tot : 0.0,
+                tot - _t_scan, tot > 0 ? 100.0 * (tot - _t_scan) / tot : 0.0);
+        fflush(stderr);
+    }
     return ids;
 }
 
