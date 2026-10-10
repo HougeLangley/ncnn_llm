@@ -234,8 +234,13 @@ NCNN_IME2_INT8=1 ai-run ./build/ncnn_llm_server --model assets/qwen3_0.6b --thre
 * **两种配置的 Coherence 测试均 PASSED**（llama-benchy 的事实性问答检查），
   且实测生成文本与 fp16 路径一致。
 
-统计图（实测数据，非模型推算）：[解码对比](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/01_decode_int8_vs_fp16.png) ·
-[预填充取舍](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/02_prefill_tradeoff.png) · [解码加速比](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/03_decode_speedup.png)
+统计图（实测数据，非模型推算）：
+
+![int8 与 fp16 的解码吞吐对比](images/k3-ime2-int8-01-decode.png)
+
+![预填充基本不受 int8 影响](images/k3-ime2-int8-02-prefill.png)
+
+![int8 带来的解码加速比](images/k3-ime2-int8-03-speedup.png)
 
 > 该模式**可选、默认关闭**；无论是否设置该变量，fp16 路径都保持逐字节不变。
 > 交互式/以解码为主的场景适合 int8；长 prompt 预填充基本不受影响。

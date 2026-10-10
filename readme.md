@@ -234,8 +234,13 @@ freshly rebuilt clang 24 binary; both configurations measured in the same sessio
 * **Coherence test PASSED for both configurations** (llama-benchy factual Q&A check), and
   generated text is identical to the fp16 path in our runs.
 
-Charts (measured, not modelled): [decode comparison](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/01_decode_int8_vs_fp16.png) ·
-[prefill trade-off](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/02_prefill_tradeoff.png) · [decode speed-up](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/03_decode_speedup.png)
+Charts (measured, not modelled):
+
+![decode throughput, int8 vs fp16](images/k3-ime2-int8-01-decode.png)
+
+![prefill is essentially unaffected by int8](images/k3-ime2-int8-02-prefill.png)
+
+![decode speed-up from int8](images/k3-ime2-int8-03-speedup.png)
 
 > The mode is **opt-in and off by default**; the fp16 path is byte-identical whether or not
 > the variable is set. int8 is a good default for interactive/decoding use; long-prompt
