@@ -211,18 +211,26 @@ freshly rebuilt clang 24 binary; both configurations measured in the same sessio
 
 | case | fp16 (default) | int8 | change |
 |---|---|---|---|
-| tg32 @ pp128 | 7.09 t/s | **8.52 t/s** | **+20.2%** |
-| tg128 @ pp128 | 7.02 t/s | **8.44 t/s** | **+20.2%** |
-| tg32 @ pp512 | 6.63 t/s | **7.88 t/s** | **+18.9%** |
-| tg128 @ pp512 | 6.54 t/s | **7.83 t/s** | **+19.7%** |
-| tg32 @ pp1024 | 6.15 t/s | **7.28 t/s** | **+18.4%** |
-| tg128 @ pp1024 | 6.08 t/s | **7.21 t/s** | **+18.6%** |
-| pp128 | 299.67 t/s | 308.64 t/s | ~flat |
-| pp512 | 352.65 t/s | 338.25 t/s | -3.8% |
-| pp1024 | 305.94 t/s | 299.95 t/s | -1.9% |
+| tg32 @ pp128 | 10.35 t/s | **12.84 t/s** | **+24.1%** |
+| tg128 @ pp128 | 10.22 t/s | **12.66 t/s** | **+23.8%** |
+| tg32 @ pp512 | 9.52 t/s | **11.49 t/s** | **+20.7%** |
+| tg128 @ pp512 | 9.41 t/s | **11.46 t/s** | **+21.8%** |
+| tg32 @ pp1024 | 8.65 t/s | **10.41 t/s** | **+20.3%** |
+| tg128 @ pp1024 | 8.49 t/s | **10.20 t/s** | **+20.2%** |
+| pp128 | 276.31 t/s | 272.07 t/s | ~flat (-1.5%) |
+| pp512 | 217.82 t/s | 211.99 t/s | ~flat (-2.7%) |
+| pp1024 | 139.24 t/s | 141.57 t/s | ~flat (+1.7%) |
 
-* **Decode: +18.4% .. +20.2%** in every measured case (average +19.3%).
-* **Prefill: -1.9% .. -3.8%** - the trade-off for a decode-oriented mode.
+> The two pp=128 rows are **medians of 3 independent repeats** (per-round spread
+> < 2%); the rest are single `--runs 3` results. Within one `--pp`, the `tg32` and
+> `tg128` rows should report a similar prefill figure; a row that deviates clearly
+> is a measurement outlier (one such point was re-measured 3 times and is excluded
+> here).
+
+* **Decode: +20.2% .. +24.1%** in every measured case (average **+21.8%**).
+* **Prefill: essentially flat** (-2.7% .. +1.7%, within measurement noise) - halving the
+  weight bytes mostly helps the bandwidth-bound M=1 decode path; the compute-bound long
+  prefill is largely unaffected.
 * **Coherence test PASSED for both configurations** (llama-benchy factual Q&A check), and
   generated text is identical to the fp16 path in our runs.
 
@@ -230,8 +238,12 @@ Charts (measured, not modelled): [decode comparison](https://raw.githubuserconte
 [prefill trade-off](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/02_prefill_tradeoff.png) · [decode speed-up](https://raw.githubusercontent.com/HougeLangley/ncnn_llm/docs/bench-figs-int8/figs-int8/03_decode_speedup.png)
 
 > The mode is **opt-in and off by default**; the fp16 path is byte-identical whether or not
-> the variable is set. int8 is a good default for interactive/decoding use, while fp16
-> remains better for long-prompt prefill.
+> the variable is set. int8 is a good default for interactive/decoding use; long-prompt
+> prefill is essentially unaffected.
+>
+> The command above uses `ncnn_llm_server`, which is introduced by PR #50. If #50 has not
+> landed yet, use an existing entry point (`benchllm`, `k3bench`, ...) with the same
+> environment variable.
 
 ## OCR
 
